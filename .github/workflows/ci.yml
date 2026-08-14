@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - run: npm run test:e2e
+
+  # Early warning against upstream churn: dsh is in developer preview with no
+  # compatibility promise, so rehearse the pinned deps against the newest rc.
+  upstream-canary:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: |
+          npm install
+          npm install --no-save \
+            @deepseek-ai/dsh-session-telemetry@latest \
+            @deepseek-ai/dsh-session@latest \
+            @deepseek-ai/dsh-llm@latest \
+            @deepseek-ai/dsh-command-feedback@latest
+      - run: npm run typecheck && npm test

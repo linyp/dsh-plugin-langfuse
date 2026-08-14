@@ -1,0 +1,54 @@
+# Test-only composition: dsh-plugin-langfuse through the real Loader/app
+# path, exporting OTLP/HTTP JSON traces to the mock collector the driver
+# starts (url via env). The plugin row loads the BUILT artifact — the same
+# file a deployment loads — so run `npm run build` before the e2e.
+- id: logger-console
+  name: '@deepseek-ai/cordis-plugin-logger-console'
+  config:
+    colors: false
+    levels:
+      default: 3
+    showTime: ''
+
+- id: mock-llm
+  name: './mock-llm.ts'
+
+# Managed child-process groups required by the bash executor.
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+
+- id: session-telemetry-langfuse
+  name: '../../lib/index.js'
+  config:
+    mode: FULL
+    exporter:
+      url: !!js process.env.LANGFUSE_E2E_URL
+    auth:
+      publicKey: pk-lf-e2e
+      secretKey: sk-lf-e2e
+    processor:
+      # Export promptly so the driver's dispose drains a short queue.
+      scheduledDelayMillis: 100
+
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    agents:
+      - id: main
+        provider: langfuse-mock
+        model: langfuse-mock
+        cwd: !!js process.cwd()
+    persona: 'Test the dsh-plugin-langfuse backend.'
+    workspaceContext: false
+
+- id: persistence
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: './.sessions'
+    compression: 'none'
+
+- id: checkpoint-policy
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'

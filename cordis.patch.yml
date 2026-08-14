@@ -1,0 +1,26 @@
+# dsh-plugin-langfuse bundle patch. Install into a profile with
+# `dsh plugin --profile <name> add dsh-plugin-langfuse`, then set
+# LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY (and LANGFUSE_HOST for
+# self-hosted or non-EU regions).
+
+# The dsh base profile mounts the official OTLP-logs backend on the
+# telemetry seam, and the seam accepts exactly one backend per context
+# (a duplicate service registration throws). Disable that row before
+# inserting this one.
+- id: session-telemetry-otel
+  disabled: true
+
+- insert:
+    - id: session-telemetry-langfuse
+      name: dsh-plugin-langfuse
+      config:
+        # Fail-safe: without a Langfuse key nothing is constructed and
+        # nothing leaves the process. With a key, LANGFUSE_TELEMETRY_MODE
+        # may still narrow to FEEDBACK_ONLY or force DISABLED.
+        mode: !!js process.env.LANGFUSE_PUBLIC_KEY ? (process.env.LANGFUSE_TELEMETRY_MODE ?? 'FULL') : 'DISABLED'
+        exporter:
+          # Langfuse's OTLP endpoint accepts traces only, over OTLP/HTTP.
+          url: !!js `${process.env.LANGFUSE_HOST ?? 'https://cloud.langfuse.com'}/api/public/otel/v1/traces`
+        auth:
+          publicKey: !!js process.env.LANGFUSE_PUBLIC_KEY
+          secretKey: !!js process.env.LANGFUSE_SECRET_KEY
