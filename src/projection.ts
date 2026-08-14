@@ -79,6 +79,8 @@ interface TurnState {
   steps: Map<number, StepState>
   /** Open tool spans keyed by the model-issued call id. */
   tools: Map<string, Span>
+  /** The step currently between `step/start` and `step/end`, if any. */
+  currentStep?: StepState
 }
 
 interface SessionState {
@@ -127,6 +129,14 @@ export class SessionSpanFolder {
     switch (record.attributes['event.type']) {
       case 'request/header': {
         state.header = body<'request/header'>(record).header
+        // The header is appended inside its step before dispatch, so the
+        // step span opened before it; stamp the model identity onto the
+        // open step now rather than only seeding the next one.
+        const open = state.turn?.currentStep
+        if (open !== undefined) {
+          open.span.setAttribute(ATTR_GEN_AI_REQUEST_MODEL, state.header.config.model)
+          open.span.setAttribute(ATTR_GEN_AI_PROVIDER_NAME, state.header.config.provider)
+        }
         return
       }
       case 'turn/start': {
@@ -173,7 +183,9 @@ export class SessionSpanFolder {
             },
           },
         }, state.turn.context)
-        state.turn.steps.set(step, { span, context: trace.setSpan(state.turn.context, span), sawFirstChunk: false })
+        const stepState: StepState = { span, context: trace.setSpan(state.turn.context, span), sawFirstChunk: false }
+        state.turn.steps.set(step, stepState)
+        state.turn.currentStep = stepState
         return
       }
       case 'assistant/chunk': {
@@ -209,6 +221,7 @@ export class SessionSpanFolder {
         if (stepState === undefined) return
         stepState.span.end(record.time)
         state.turn?.steps.delete(step)
+        if (state.turn?.currentStep === stepState) state.turn.currentStep = undefined
         return
       }
       case 'tool/call': {

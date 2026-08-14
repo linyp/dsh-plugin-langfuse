@@ -1,0 +1,54 @@
+# Key-gated cloud composition: identical to the mock fixture except the
+# exporter points at the REAL Langfuse OTLP endpoint, authenticated from
+# LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY (region via LANGFUSE_HOST).
+# Loaded only by the self-skipping cloud e2e; requires `npm run build`.
+- id: logger-console
+  name: '@deepseek-ai/cordis-plugin-logger-console'
+  config:
+    colors: false
+    levels:
+      default: 3
+    showTime: ''
+
+- id: mock-llm
+  name: './mock-llm.ts'
+
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
+- id: bash
+  name: '@deepseek-ai/dsh-bash-local'
+
+- id: session-telemetry-langfuse
+  name: '../../lib/index.js'
+  config:
+    mode: FULL
+    exporter:
+      # Backtick template literals cannot start a YAML plain scalar; concatenate.
+      url: !!js (process.env.LANGFUSE_HOST ?? 'https://cloud.langfuse.com') + '/api/public/otel/v1/traces'
+    auth:
+      publicKey: !!js process.env.LANGFUSE_PUBLIC_KEY
+      secretKey: !!js process.env.LANGFUSE_SECRET_KEY
+    processor:
+      # Export promptly so the driver's dispose drains a short queue.
+      scheduledDelayMillis: 100
+
+- id: agent-spine
+  name: '@deepseek-ai/dsh-agent-spine-demo'
+  config:
+    agents:
+      - id: main
+        provider: langfuse-mock
+        model: langfuse-mock
+        cwd: !!js process.cwd()
+    persona: 'Test the dsh-plugin-langfuse backend against Langfuse cloud.'
+    workspaceContext: false
+
+- id: persistence
+  name: '@deepseek-ai/dsh-session-persistence-jsonl'
+  config:
+    root: './.sessions'
+    compression: 'none'
+
+- id: checkpoint-policy
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'

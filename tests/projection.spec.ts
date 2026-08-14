@@ -125,6 +125,21 @@ describe('SessionSpanFolder', () => {
     expect(spans.get('tool bash')!.parentSpanContext?.spanId).toBe(spans.get('turn 1')!.spanContext().spanId)
   })
 
+  it('stamps model identity from a request/header appended inside its own step', () => {
+    // The real loop appends request/header AFTER step/start (inside the
+    // step, before dispatch), so the first step must receive the model
+    // attributes retroactively rather than from a pre-seeded snapshot.
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('step/start', 2, 1_010, { turn: 1, step: 1 }))
+    folder.fold(ledger('request/header', 3, 1_020, HEADER))
+    folder.fold(ledger('step/end', 4, 1_030, { turn: 1, step: 1 }))
+    folder.fold(ledger('turn/end', 5, 1_040, { turn: 1, reason: { kind: 'completed' } }))
+
+    const step = spansByName().get('step 1')!
+    expect(step.attributes['gen_ai.request.model']).toBe('deepseek-chat')
+    expect(step.attributes['gen_ai.provider.name']).toBe('deepseek')
+  })
+
   it('treats seq gaps as routine: a step with no chunk record still folds cleanly', () => {
     folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
     folder.fold(ledger('step/start', 4, 1_010, { turn: 1, step: 0 }))
