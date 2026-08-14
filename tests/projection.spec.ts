@@ -97,8 +97,10 @@ describe('SessionSpanFolder', () => {
     expect(millis(step.startTime)).toBe(1_030)
     expect(millis(step.endTime)).toBe(2_020)
 
+    // A step is one model request plus the tools it calls, so the tool span
+    // nests under its requesting step's generation span.
     const tool = spans.get('tool bash')!
-    expect(tool.parentSpanContext?.spanId).toBe(turn.spanContext().spanId)
+    expect(tool.parentSpanContext?.spanId).toBe(step.spanContext().spanId)
     expect(tool.attributes['langfuse.observation.type']).toBe('tool')
     expect(tool.attributes['gen_ai.tool.name']).toBe('bash')
     expect(tool.attributes['gen_ai.tool.call.id']).toBe('call-1')
@@ -119,6 +121,8 @@ describe('SessionSpanFolder', () => {
     const spans = spansByName()
     expect(spans.get('tool bash')!.status.code).toBe(SpanStatusCode.ERROR)
     expect(spans.get('turn 1')!.status.code).toBe(SpanStatusCode.ERROR)
+    // No step/start was folded, so the tool span falls back to the turn parent.
+    expect(spans.get('tool bash')!.parentSpanContext?.spanId).toBe(spans.get('turn 1')!.spanContext().spanId)
   })
 
   it('treats seq gaps as routine: a step with no chunk record still folds cleanly', () => {
@@ -176,8 +180,31 @@ describe('SessionSpanFolder', () => {
     expect(spansByName().get('turn 1')!.attributes['dsh.force_ended']).toBe(true)
   })
 
+  it('clips oversized payloads at the configured attribute budget', () => {
+    const clippedExporter = new InMemorySpanExporter()
+    const provider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(clippedExporter)],
+    })
+    const small = new SessionSpanFolder(provider.getTracer('test'), { maxAttributeChars: 64 })
+    small.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    small.fold(ledger('tool/call', 2, 1_010, { turn: 1, step: 0, callId: 'call-1', name: 'bash', arguments: 'x'.repeat(500) }))
+    small.fold(ledger('tool/result', 3, 1_020, {
+      turn: 1,
+      step: 0,
+      message: { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call-1', content: [{ type: 'text', text: 'y'.repeat(500) }] }] },
+    }))
+    small.fold(ledger('turn/end', 4, 1_030, { turn: 1, reason: { kind: 'completed' } }))
+
+    const tool = clippedExporter.getFinishedSpans().find(span => span.name === 'tool bash')!
+    const input = tool.attributes['langfuse.observation.input'] as string
+    const output = tool.attributes['langfuse.observation.output'] as string
+    for (const clipped of [input, output]) {
+      expect(clipped.endsWith('…[clipped]')).toBe(true)
+      expect(clipped.length).toBe(64 + '…[clipped]'.length)
+    }
+  })
+
   it.todo('FEEDBACK_ONLY replay: a historical prefix rebuilds the identical tree (same mechanism, add a scripted replay fixture)')
   it.todo('fork/resume lineage: seeds never re-fold; stitch via session.parent_id trace links')
   it.todo('agent-error ops record marks the open turn span with an exception event')
-  it.todo('clipping: an oversized tool result is truncated at the attribute budget')
 })

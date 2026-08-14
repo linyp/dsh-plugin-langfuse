@@ -51,21 +51,23 @@ import {
 } from './semconv.ts'
 
 /**
- * Serialized-payload ceiling per span attribute. Guards the export pipeline
- * against multi-megabyte tool output; the canonical session log keeps the
- * full bytes. TODO: promote to a validated config field once a deployment
- * needs a different budget.
+ * Default serialized-payload ceiling per span attribute. Guards the export
+ * pipeline against multi-megabyte tool output; the canonical session log
+ * keeps the full bytes. Deployments change it through the plugin's
+ * `maxAttributeChars` config field.
  */
-const MAX_ATTRIBUTE_CHARS = 32_768
+export const DEFAULT_MAX_ATTRIBUTE_CHARS = 32_768
 
-/** Serialize a payload for a span attribute, clipped to {@link MAX_ATTRIBUTE_CHARS}. */
-function clip(value: unknown): string {
+/** Serialize a payload for a span attribute, clipped to `budget` characters. */
+function clip(value: unknown, budget: number): string {
   const text = JSON.stringify(value) ?? 'null'
-  return text.length <= MAX_ATTRIBUTE_CHARS ? text : `${text.slice(0, MAX_ATTRIBUTE_CHARS)}…[clipped]`
+  return text.length <= budget ? text : `${text.slice(0, budget)}…[clipped]`
 }
 
 interface StepState {
   span: Span
+  /** OTel context carrying the step span, parent for its tool children. */
+  context: OtelContext
   sawFirstChunk: boolean
 }
 
@@ -97,8 +99,16 @@ function body<T extends keyof SessionEventMap>(record: SessionTelemetryRecord): 
  */
 export class SessionSpanFolder {
   private readonly sessions = new Map<string, SessionState>()
+  private readonly maxAttributeChars: number
 
-  constructor(private readonly tracer: Tracer) {}
+  constructor(private readonly tracer: Tracer, options?: { maxAttributeChars?: number }) {
+    this.maxAttributeChars = options?.maxAttributeChars ?? DEFAULT_MAX_ATTRIBUTE_CHARS
+  }
+
+  /** Serialize a payload for a span attribute within this folder's budget. */
+  private clip(value: unknown): string {
+    return clip(value, this.maxAttributeChars)
+  }
 
   /**
    * Fold one handed-over record into the span tree. Synchronous O(1) map
@@ -144,7 +154,7 @@ export class SessionSpanFolder {
         return
       }
       case 'user/message': {
-        state.turn?.span.setAttribute(ATTR_LANGFUSE_TRACE_INPUT, clip(record.body))
+        state.turn?.span.setAttribute(ATTR_LANGFUSE_TRACE_INPUT, this.clip(record.body))
         return
       }
       case 'step/start': {
@@ -163,7 +173,7 @@ export class SessionSpanFolder {
             },
           },
         }, state.turn.context)
-        state.turn.steps.set(step, { span, sawFirstChunk: false })
+        state.turn.steps.set(step, { span, context: trace.setSpan(state.turn.context, span), sawFirstChunk: false })
         return
       }
       case 'assistant/chunk': {
@@ -180,7 +190,7 @@ export class SessionSpanFolder {
         const { step, message, usage } = body<'assistant/message'>(record)
         const stepState = state.turn?.steps.get(step)
         if (stepState === undefined) return
-        stepState.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, clip(message))
+        stepState.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, this.clip(message))
         if (usage !== undefined) {
           stepState.span.setAttribute(ATTR_GEN_AI_USAGE_INPUT_TOKENS, usage.inputTokens)
           stepState.span.setAttribute(ATTR_GEN_AI_USAGE_OUTPUT_TOKENS, usage.outputTokens)
@@ -204,20 +214,23 @@ export class SessionSpanFolder {
       case 'tool/call': {
         if (state.turn === undefined) return
         const { turn, step, callId, name, arguments: args } = body<'tool/call'>(record)
-        // Tool spans are children of the turn, not the generation: execution
-        // happens after the model stream that requested it has completed.
+        // A step is one model request plus the tools it calls, so the tool
+        // span nests under its requesting step's generation span; a call
+        // whose step is no longer open (crash-window replay) falls back to
+        // the turn.
+        const parent = state.turn.steps.get(step)?.context ?? state.turn.context
         const span = this.tracer.startSpan(`tool ${name}`, {
           startTime: record.time,
           attributes: {
             [ATTR_LANGFUSE_OBSERVATION_TYPE]: 'tool',
             [ATTR_GEN_AI_TOOL_NAME]: name,
             [ATTR_GEN_AI_TOOL_CALL_ID]: String(callId),
-            [ATTR_LANGFUSE_OBSERVATION_INPUT]: clip(args),
+            [ATTR_LANGFUSE_OBSERVATION_INPUT]: this.clip(args),
             [ATTR_DSH_TURN]: turn,
             [ATTR_DSH_STEP]: step,
             [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
           },
-        }, state.turn.context)
+        }, parent)
         state.turn.tools.set(String(callId), span)
         return
       }
@@ -226,7 +239,7 @@ export class SessionSpanFolder {
         const callId = String(message.content[0].toolCallId)
         const span = state.turn?.tools.get(callId)
         if (span === undefined) return
-        span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, clip(message.content[0].content))
+        span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, this.clip(message.content[0].content))
         if (record.severity === 'error') span.setStatus({ code: SpanStatusCode.ERROR })
         span.end(record.time)
         state.turn?.tools.delete(callId)
@@ -235,7 +248,7 @@ export class SessionSpanFolder {
       case 'turn/end': {
         if (state.turn === undefined) return
         const { reason } = body<'turn/end'>(record)
-        state.turn.span.setAttribute(ATTR_DSH_TURN_END_REASON, clip(reason))
+        state.turn.span.setAttribute(ATTR_DSH_TURN_END_REASON, this.clip(reason))
         if (record.severity === 'error') state.turn.span.setStatus({ code: SpanStatusCode.ERROR })
         this.endTurn(state, record.time, false)
         return

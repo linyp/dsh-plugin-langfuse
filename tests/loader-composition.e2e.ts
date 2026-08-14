@@ -77,8 +77,9 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         expect(attr(generation, 'langfuse.observation.type')).toEqual({ stringValue: 'generation' })
         expect(attr(generation, 'gen_ai.usage.input_tokens')).toEqual({ intValue: 11 })
 
+        // The tool span nests under the generation whose model request called it.
         const tool = spans.find(span => span.name === 'tool bash')!
-        expect(tool.parentSpanId).toBe(turn.spanId)
+        expect(tool.parentSpanId).toBe(generation.spanId)
         expect(attr(tool, 'langfuse.observation.output')).toBeDefined()
       },
     })

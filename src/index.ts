@@ -28,7 +28,9 @@ import { APP_IDENTITY } from '@deepseek-ai/dsh-llm'
 import type { OTLPExporterNodeConfigBase } from '@opentelemetry/otlp-exporter-base'
 import type { BufferConfig } from '@opentelemetry/sdk-trace-base'
 import { buildBasicAuthHeader, buildTracerPipeline, type TracerPipeline } from './otel.ts'
-import { SessionSpanFolder } from './projection.ts'
+import { DEFAULT_MAX_ATTRIBUTE_CHARS, SessionSpanFolder } from './projection.ts'
+
+export { DEFAULT_MAX_ATTRIBUTE_CHARS }
 
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string }
 
@@ -104,6 +106,13 @@ export interface Config {
   }
   /** Passed verbatim to `BatchSpanProcessor`; the SDK owns and documents these knobs. */
   processor?: BufferConfig
+  /**
+   * Serialized-payload ceiling per span attribute (characters); longer
+   * payloads are clipped with an `…[clipped]` marker. The canonical session
+   * log keeps the full bytes. Defaults to
+   * {@link DEFAULT_MAX_ATTRIBUTE_CHARS}.
+   */
+  maxAttributeChars?: number
   /** Maximum time spent awaiting the SDK provider's complete shutdown path. */
   shutdownTimeoutMillis?: number
 }
@@ -119,6 +128,7 @@ export const Config: z<Config> = z.object({
   exporter: z.any(),
   auth: z.any(),
   processor: z.any(),
+  maxAttributeChars: z.number(),
   shutdownTimeoutMillis: z.number(),
 })
 
@@ -181,6 +191,10 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
     if (batchSize !== undefined && (!Number.isInteger(batchSize) || batchSize < 1)) {
       throw new Error(`dsh-plugin-langfuse: processor.maxExportBatchSize must be a positive integer, got ${String(batchSize)}`)
     }
+    const maxAttributeChars = config.maxAttributeChars
+    if (maxAttributeChars !== undefined && (!Number.isInteger(maxAttributeChars) || maxAttributeChars < 1)) {
+      throw new Error(`dsh-plugin-langfuse: maxAttributeChars must be a positive integer, got ${String(maxAttributeChars)}`)
+    }
     const shutdownTimeoutMillis = config.shutdownTimeoutMillis ?? DEFAULT_SHUTDOWN_TIMEOUT_MILLIS
     if (!Number.isFinite(shutdownTimeoutMillis) || shutdownTimeoutMillis <= 0 || shutdownTimeoutMillis > MAX_TIMER_DELAY_MILLIS) {
       throw new Error(`dsh-plugin-langfuse: shutdownTimeoutMillis must be a positive finite number no greater than ${MAX_TIMER_DELAY_MILLIS}, got ${String(shutdownTimeoutMillis)}`)
@@ -196,7 +210,7 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
       scopeName: 'dsh-plugin-langfuse',
       scopeVersion: version,
     })
-    const folder = new SessionSpanFolder(this.pipeline.tracer)
+    const folder = new SessionSpanFolder(this.pipeline.tracer, { maxAttributeChars })
     this.folder = folder
     const enqueue: SessionTelemetrySink['emit'] = (record: SessionTelemetryRecord) => folder.fold(record)
     const backend: SessionTelemetrySink = {

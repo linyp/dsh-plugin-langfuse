@@ -44,6 +44,7 @@ export LANGFUSE_HOST=https://us.cloud.langfuse.com
 | `exporter` | 完整的 `OTLPExporterNodeConfigBase` 对象，原样透传给 OTLP/HTTP trace exporter。非 `DISABLED` 模式下 `url` 必填，且必须是**完整的 traces 路径**（`…/api/public/otel/v1/traces`）。 |
 | `auth` | Langfuse 项目密钥对，转换为端点的 Basic-auth 请求头。与显式的 `exporter.headers` authorization 互斥；上传模式要求两者恰好提供其一。 |
 | `processor` | 原样透传给 `BatchSpanProcessor`（`scheduledDelayMillis`、`maxQueueSize`、`maxExportBatchSize` 等）；批处理、重试、丢失策略均为 SDK 的文档化行为。 |
+| `maxAttributeChars` | 每个 span 属性的序列化 payload 上限（默认 32768）；超长部分以 `…[clipped]` 标记裁剪，canonical 会话日志保留完整字节。 |
 | `shutdownTimeoutMillis` | 插件持有的 SDK shutdown 排水外层截止时间（默认 3000）。 |
 
 错误配置在插件加载时即失败：`url` 缺失/畸形/非 http(s)、凭据缺失、双重鉴权歧义、非正的 `maxExportBatchSize`（SDK 会在 shutdown 时挂死）、未知 `mode`，全部在构造任何传输之前抛出。
@@ -87,7 +88,7 @@ seam 的记录与会话日志事件一一对应；Langfuse 需要 trace → obse
 - **时间戳永远取记录的 `time`，绝不取墙钟**，因此实时捕获与 `FEEDBACK_ONLY` 的 canonical 日志重放产出完全相同的树（span 起止时间显式指定 —— OTel API 支持历史时间戳）。
 - **`seq` 空洞是常态，绝不是丢失信号**：seam 每个 step 只发首个 `assistant/chunk`（流已启动信号；其时间即首 token 时间）。折叠器依赖这一点而非计数。
 - **severity 用 seam 预映射的值**；折叠器把 `error` 映射到 span 状态，绝不重新推导事件语义。
-- **tool span 是 turn 的子节点，不是 generation 的**：工具执行发生在请求它的模型流完成之后，嵌进 step span 会捏造一个时间上不存在的包含关系。
+- **tool span 是其 step 的 generation span 的子节点**：harness 定义 step 为一次模型请求*加上它调用的工具* —— `tool/call` 与 `tool/result` 都落在 step 边界之内 —— 因此 generation span 在时间上包含它的工具执行。step 已不再开放的调用（崩溃窗口重放）回退挂到 turn span。
 - **未知事件类型落为开放 turn 上的 span event** —— 事件词汇表是 merge-extensible 的，丢弃未知类型会悄悄稀释时间线。
 - **强制收尾扫描**在三处关闭仍开放的 span（标记 `dsh.force_ended`）：新 `turn/start` 到来而前一个 turn 未闭合、会话的 ops `shutdown` 记录、后端 shutdown —— teardown 绝不把已开始的 span 遗弃在 SDK 队列里。
 
@@ -97,7 +98,15 @@ seam 的记录与会话日志事件一一对应；Langfuse 需要 trace → obse
 
 ### 5. 什么数据离开本机
 
-上传模式下，span 属性携带用户与助手消息内容、工具参数与结果、模型/用量元数据，以 `session-telemetry/record` waterfall 的返回值为准。**本插件不带任何脱敏规则**；导出跨越信任边界的部署需自行挂载 waterfall listener。Provider API key 结构性缺席（它们是构造参数，从不是会话事件）。序列化 payload 每属性裁剪至 32 KiB；canonical 日志保留完整字节。
+上传模式下，span 属性携带用户与助手消息内容、工具参数与结果、模型/用量元数据，以 `session-telemetry/record` waterfall 的返回值为准。**本插件不带任何脱敏规则**；导出跨越信任边界的部署需自行挂载 waterfall listener。Provider API key 结构性缺席（它们是构造参数，从不是会话事件）。序列化 payload 每属性按 `maxAttributeChars` 裁剪（默认 32768）；canonical 日志保留完整字节。
+
+## Model Experience
+
+无。本插件仅通过 telemetry seam 观察会话流并把折叠出的 span 交给 OTel SDK，从不向模型请求贡献任何内容。
+
+#### KV Cache 影响
+
+无。本插件既不组装也不发送 provider 请求。
 
 ## 测试
 
@@ -123,7 +132,6 @@ DeepSeek Harness 处于 developer preview，无兼容承诺；本插件精确锁
 - **`feedback/record` → Langfuse score** 延后；需要 `@langfuse/client` 或 public ingestion API（决策 2）。
 - **Subagent 血缘未拼接**：fork 出的会话其 trace 树从继承边界开始；`session.parent_id`/`seed_length` 随属性携带，但尚未创建 trace link。
 - **无持久化投递**（决策 4）。
-- **属性裁剪预算固定**为 32 KiB；有部署需要不同预算时再提升为配置项。
 - **每个 context 只能有一个后端**：同时运行 Langfuse 和官方 OTLP-logs 后端需要上游 seam 演进出 multi-sink。
 
 ## 许可证

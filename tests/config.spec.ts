@@ -1,11 +1,13 @@
 /**
  * Config fail-loud tier: every acceptance path proves it rejects an invalid
  * case at plugin load, before any SDK transport is constructed, plus the
- * DISABLED short-circuit and the Basic-auth header builder.
+ * DISABLED short-circuit, the Basic-auth header builder, and the HMR-safety
+ * proof that the service registration disposes with its fiber.
  */
 
 import { describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import SessionStore from '@deepseek-ai/dsh-session'
 import { buildBasicAuthHeader } from '../src/otel.ts'
 import {
   DEFAULT_TELEMETRY_MODE,
@@ -71,6 +73,15 @@ describe('config validation', () => {
     })).toThrow(/maxExportBatchSize/)
   })
 
+  it('rejects a non-positive maxAttributeChars', () => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.FULL,
+      auth: AUTH,
+      exporter: { url: URL_OK },
+      maxAttributeChars: 0,
+    })).toThrow(/maxAttributeChars/)
+  })
+
   it('rejects a non-positive shutdownTimeoutMillis', () => {
     expect(() => construct({
       mode: LangfuseTelemetryMode.FULL,
@@ -83,5 +94,22 @@ describe('config validation', () => {
   it('rejects an unknown mode smuggled past the schema by direct construction', () => {
     expect(() => construct({ mode: 'EVERYTHING' as LangfuseTelemetryMode }))
       .toThrow(/unsupported mode/)
+  })
+})
+
+describe('service lifecycle', () => {
+  it('disposes its service registration with the fiber and mounts again cleanly', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+
+    const fiber = await ctx.plugin(LangfuseSessionTelemetryBackend, { mode: LangfuseTelemetryMode.DISABLED })
+    expect(ctx.get('sessionTelemetry')).toBeDefined()
+
+    await fiber.dispose()
+    expect(ctx.get('sessionTelemetry')).toBeUndefined()
+
+    // A leaked registration would throw the seam's duplicate-service error here.
+    await ctx.plugin(LangfuseSessionTelemetryBackend, { mode: LangfuseTelemetryMode.DISABLED })
+    expect(ctx.get('sessionTelemetry')).toBeDefined()
   })
 })

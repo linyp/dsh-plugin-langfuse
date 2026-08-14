@@ -44,6 +44,7 @@ Or as an explicit `cordis.yml` row:
 | `exporter` | The complete `OTLPExporterNodeConfigBase` object, passed verbatim to the OTLP/HTTP trace exporter. `url` is required outside `DISABLED` and must be the **full traces path** (`…/api/public/otel/v1/traces`). |
 | `auth` | Langfuse project key pair, turned into the endpoint's Basic-auth header. Mutually exclusive with an explicit `exporter.headers` authorization; uploading modes require exactly one of the two. |
 | `processor` | Passed verbatim to `BatchSpanProcessor` (`scheduledDelayMillis`, `maxQueueSize`, `maxExportBatchSize`, …); batching, retry, and loss policy are the SDK's documented behavior. |
+| `maxAttributeChars` | Serialized-payload ceiling per span attribute (default 32768); longer payloads are clipped with an `…[clipped]` marker while the canonical session log keeps the full bytes. |
 | `shutdownTimeoutMillis` | Plugin-owned outer deadline on the SDK's shutdown drain (default 3000). |
 
 Misconfiguration fails loud at plugin load: a missing/malformed/non-http(s) `url`, missing credentials, ambiguous double auth, a non-positive `maxExportBatchSize` (the SDK would hang on shutdown), or an unknown `mode` all throw before any transport is constructed.
@@ -87,7 +88,7 @@ The seam's records mirror session-log events one-to-one; Langfuse needs trace �
 - **Timestamps always come from the record's `time`, never the wall clock**, so live capture and `FEEDBACK_ONLY` canonical-log replay produce identical trees (span start/end times are explicit — the OTel API supports historical stamps).
 - **`seq` gaps are routine, never a loss signal**: the seam ships only the first `assistant/chunk` per step (the stream-started signal; its time is the first-token time). The folder relies on this instead of counting.
 - **Severity is the seam's pre-mapped value**; the folder maps `error` onto span status and never re-derives event semantics.
-- **Tool spans are children of the turn, not the generation**: tool execution happens after the model stream that requested it has completed, so nesting them under the step span would fabricate a containment that does not exist in time.
+- **Tool spans are children of their step's generation span**: the harness defines a step as one model request *plus the tools it calls* — `tool/call` and `tool/result` land inside the step's boundaries — so the generation span temporally contains its tool executions. A call whose step is no longer open (crash-window replay) falls back to the turn span.
 - **Unknown event types land as span events on the open turn** — the event vocabulary is merge-extensible, and dropping unknown types would silently thin the timeline.
 - **Force-end sweeps** close still-open spans (marked `dsh.force_ended`) on a next `turn/start` with an open predecessor, on the session's ops `shutdown` record, and on backend shutdown — teardown never abandons started spans inside the SDK queue.
 
@@ -97,7 +98,15 @@ Inherited from the seam: the cursor marks *handed off*, not delivered; whatever 
 
 ### 5. What leaves the machine
 
-In uploading modes, span attributes carry user and assistant message content, tool arguments and results, and model/usage metadata, as returned by the `session-telemetry/record` waterfall. **This plugin ships no redaction rules**; a deployment exporting beyond a trusted boundary mounts its own waterfall listener. Provider API keys are structurally absent (they are constructor parameters, never session events). Serialized payloads are clipped at 32 KiB per attribute; the canonical log keeps the full bytes.
+In uploading modes, span attributes carry user and assistant message content, tool arguments and results, and model/usage metadata, as returned by the `session-telemetry/record` waterfall. **This plugin ships no redaction rules**; a deployment exporting beyond a trusted boundary mounts its own waterfall listener. Provider API keys are structurally absent (they are constructor parameters, never session events). Serialized payloads are clipped at `maxAttributeChars` per attribute (default 32768); the canonical log keeps the full bytes.
+
+## Model Experience
+
+None, as this plugin only observes the session stream through the telemetry seam and hands folded spans to the OTel SDK; it never contributes to a model request.
+
+#### KV Cache effect
+
+None; this plugin neither assembles nor sends a provider request.
 
 ## Testing
 
@@ -123,7 +132,6 @@ DeepSeek Harness is in developer preview with no compatibility promises; this pl
 - **`feedback/record` → Langfuse score** is deferred; it needs `@langfuse/client` or the public ingestion API (decision 2).
 - **Subagent lineage** is not stitched: a forked session's trace tree starts at its inherited boundary; `session.parent_id`/`seed_length` ride the resource attributes but no trace links are created yet.
 - **No durable delivery** (decision 4).
-- **Attribute clip budget is fixed** at 32 KiB; promote to config when a deployment needs a different budget.
 - **One backend per context**: running Langfuse *and* the official OTLP-logs backend simultaneously requires a multi-sink evolution of the upstream seam.
 
 ## License
