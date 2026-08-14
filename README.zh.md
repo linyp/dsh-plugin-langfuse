@@ -8,17 +8,23 @@
 
 ## 安装
 
+以下命令假设已安装 `dsh` CLI。如果你是从官方仓库[源码 checkout](https://github.com/deepseek-ai/deepseek-harness) 运行 harness，把每条命令改为在 checkout 根目录执行 `pnpm dsh …`（先跑它的 `pnpm run build`）—— 命令相同，profile 也是同一个 `web`。
+
 作为 profile bundle 安装（包内附带 `cordis.patch.yml` patch 层）：
 
 ```sh
 dsh plugin --profile web add dsh-plugin-langfuse
 export LANGFUSE_PUBLIC_KEY=pk-lf-…
 export LANGFUSE_SECRET_KEY=sk-lf-…
-# 可选，默认 https://cloud.langfuse.com
+# 可选，默认 https://cloud.langfuse.com（EU 区）；注意插件读取的是
+# LANGFUSE_HOST，而不是 Langfuse SDK 惯用的 LANGFUSE_BASE_URL
 export LANGFUSE_HOST=https://us.cloud.langfuse.com
+dsh web                        # 即 dsh --profile web 的别名
 ```
 
 附带的 patch 会禁用 base profile 的 `session-telemetry-otel` 行（telemetry seam 每个 context 只接受一个后端；重复加载会抛错），并在存在 Langfuse key 时以 `FULL` 模式挂载本后端，否则为 `DISABLED`。设置 `LANGFUSE_TELEMETRY_MODE=FEEDBACK_ONLY` 可将共享收窄为反馈门控释放。
+
+bundle 层和环境变量都在启动时读取：安装后必须重启已在运行的实例，且启动 shell 里要带上这些变量。`dsh --profile web --dump-config` 可以不启动就查看组合结果 —— 应出现一个 `# == dsh-plugin-langfuse` 层，它 patch 掉 base 的 telemetry 行并新增 env 驱动模式的 `session-telemetry-langfuse` 行。跑完下一轮对话后，trace 出现在 **`LANGFUSE_HOST` 所指区域**的 Langfuse 控制台 —— 密钥按区域隔离，US 区项目在 EU 控制台上什么都看不到。`dsh plugin --profile web remove dsh-plugin-langfuse` 会同时移除依赖和对应的层。
 
 也可以作为显式 `cordis.yml` 行挂载：
 

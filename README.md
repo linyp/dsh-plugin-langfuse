@@ -8,17 +8,23 @@ This is a community plugin (`dsh-plugin` topic), not part of the official reposi
 
 ## Install
 
+The commands below assume the installed `dsh` CLI. Running the official harness from a [source checkout](https://github.com/deepseek-ai/deepseek-harness) instead? Run each of them as `pnpm dsh …` from the checkout root (after its `pnpm run build`) — same commands, same `web` profile.
+
 As a profile bundle (the package ships a `cordis.patch.yml` patch layer):
 
 ```sh
 dsh plugin --profile web add dsh-plugin-langfuse
 export LANGFUSE_PUBLIC_KEY=pk-lf-…
 export LANGFUSE_SECRET_KEY=sk-lf-…
-# optional, defaults to https://cloud.langfuse.com
+# optional, defaults to https://cloud.langfuse.com (EU region); note the plugin
+# reads LANGFUSE_HOST, not the Langfuse SDK's LANGFUSE_BASE_URL
 export LANGFUSE_HOST=https://us.cloud.langfuse.com
+dsh web                        # alias for: dsh --profile web
 ```
 
 The bundled patch disables the base profile's `session-telemetry-otel` row (the telemetry seam accepts exactly one backend per context; a duplicate load throws) and mounts this backend in `FULL` mode when a Langfuse key is present, `DISABLED` otherwise. `LANGFUSE_TELEMETRY_MODE=FEEDBACK_ONLY` narrows sharing to feedback-gated release.
+
+Both the bundle layer and the env vars are read at boot: an already-running instance must be restarted after installing, from a shell that has the variables set. `dsh --profile web --dump-config` shows the composed result without booting — a `# == dsh-plugin-langfuse` layer that patches the base telemetry row and adds `session-telemetry-langfuse` with its env-driven mode. After the next turn, traces appear in the Langfuse console **of the region `LANGFUSE_HOST` points at** — keys are region-scoped, so a US project shows nothing on the EU console. `dsh plugin --profile web remove dsh-plugin-langfuse` removes both the dependency and the layer.
 
 Or as an explicit `cordis.yml` row:
 
