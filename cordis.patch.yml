@@ -16,8 +16,9 @@
       config:
         # Fail-safe: without a Langfuse key nothing is constructed and
         # nothing leaves the process. With a key, LANGFUSE_TELEMETRY_MODE
-        # may still narrow to FEEDBACK_ONLY or force DISABLED.
-        mode: !!js process.env.LANGFUSE_PUBLIC_KEY ? (process.env.LANGFUSE_TELEMETRY_MODE ?? 'FULL') : 'DISABLED'
+        # may still narrow to FEEDBACK_ONLY or force DISABLED. No ternary:
+        # a `: ` inside a plain scalar starts a YAML mapping.
+        mode: !!js (process.env.LANGFUSE_PUBLIC_KEY && (process.env.LANGFUSE_TELEMETRY_MODE || 'FULL')) || 'DISABLED'
         exporter:
           # Langfuse's OTLP endpoint accepts traces only, over OTLP/HTTP.
           # Backtick template literals cannot start a YAML plain scalar; concatenate.
