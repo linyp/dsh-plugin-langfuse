@@ -29,6 +29,7 @@ interface OtlpSpan {
 interface Capture {
   path: string
   authorization: string | undefined
+  ingestionVersion: string | undefined
   body: {
     resourceSpans?: {
       resource?: { attributes?: { key: string; value: Record<string, unknown> }[] }
@@ -59,6 +60,8 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         for (const capture of captures) {
           expect(capture.path).toBe('/api/public/otel/v1/traces')
           expect(capture.authorization).toBe(`Basic ${Buffer.from('pk-lf-e2e:sk-lf-e2e').toString('base64')}`)
+          // Defaulted so new spans land on Langfuse's v4 data model in real time.
+          expect(capture.ingestionVersion).toBe('4')
         }
 
         const spans = captures.flatMap(capture =>
@@ -70,7 +73,12 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         expect(names).toContain('tool bash')
 
         const turn = spans.find(span => span.name === 'turn 1')!
+        expect(attr(turn, 'langfuse.observation.input')).toBeDefined()
+        expect(attr(turn, 'langfuse.observation.output')).toBeDefined()
+        // Legacy aliases remain for trace-level evaluators during migration.
         expect(attr(turn, 'langfuse.trace.input')).toBeDefined()
+        expect(attr(turn, 'langfuse.trace.output')).toBeDefined()
+        expect(attr(turn, 'dsh.session.id')).toBeDefined()
 
         const generation = spans.find(span => span.name === 'step 1')!
         expect(generation.parentSpanId).toBe(turn.spanId)
@@ -81,6 +89,13 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         const tool = spans.find(span => span.name === 'tool bash')!
         expect(tool.parentSpanId).toBe(generation.spanId)
         expect(attr(tool, 'langfuse.observation.output')).toBeDefined()
+
+        // Correlation identity rides every span on the wire — Langfuse v4
+        // filters per observation, so the root-span stamp alone is not enough.
+        for (const span of [turn, generation, tool]) {
+          expect(attr(span, 'langfuse.session.id'), `${span.name} session`).toEqual({ stringValue: 'e2e-host-session' })
+          expect(attr(span, 'langfuse.user.id'), `${span.name} user`).toEqual({ stringValue: 'e2e-host-user' })
+        }
       },
     })
   })

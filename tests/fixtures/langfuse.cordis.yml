@@ -29,6 +29,9 @@
     auth:
       publicKey: pk-lf-e2e
       secretKey: sk-lf-e2e
+    correlation:
+      userId: e2e-host-user
+      sessionId: e2e-host-session
     processor:
       # Export promptly so the driver's dispose drains a short queue.
       scheduledDelayMillis: 100

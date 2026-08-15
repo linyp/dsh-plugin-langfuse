@@ -19,6 +19,7 @@ if (configPath === undefined) throw new Error('langfuse driver requires a config
 interface Capture {
   path: string
   authorization: string | undefined
+  ingestionVersion: string | undefined
   body: unknown
 }
 
@@ -27,9 +28,11 @@ const server = createServer((request, response) => {
   const chunks: Buffer[] = []
   request.on('data', chunk => chunks.push(chunk as Buffer))
   request.on('end', () => {
+    const ingestionVersion = request.headers['x-langfuse-ingestion-version']
     captures.push({
       path: request.url ?? '',
       authorization: request.headers.authorization,
+      ingestionVersion: Array.isArray(ingestionVersion) ? ingestionVersion[0] : ingestionVersion,
       body: JSON.parse(Buffer.concat(chunks).toString()),
     })
     response.writeHead(200, { 'content-type': 'application/json' }).end('{}')

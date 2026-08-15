@@ -43,6 +43,17 @@ interface TraceDetail extends TraceSummary {
   observations?: Observation[]
 }
 
+/** Row shape of the v4-era `/api/public/v2/observations` list. */
+interface V2Observation {
+  type?: string
+  name?: string
+  sessionId?: string
+  userId?: string
+  isRootObservation?: boolean
+  input?: unknown
+  output?: unknown
+}
+
 async function api<T>(path: string): Promise<T> {
   const response = await fetch(`${HOST}${path}`, {
     headers: { authorization: `Basic ${Buffer.from(`${PUBLIC_KEY}:${SECRET_KEY}`).toString('base64')}` },
@@ -108,5 +119,32 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     const requestingStep = observations.find(observation => observation.name === 'step 1')
     expect(requestingStep).toBeDefined()
     expect(tool!.parentObservationId).toBe(requestingStep!.id)
+
+    // v4 queries filter per observation, so identity must ride every span:
+    // each generation/tool row of the observation-first API serves its own
+    // session/user fields — the root-span stamp alone is not the contract.
+    let rows: V2Observation[] = []
+    let root: V2Observation | undefined
+    const v2Deadline = Date.now() + INGESTION_DEADLINE_MS
+    for (;;) {
+      const page = await api<{ data?: V2Observation[] }>(`/api/public/v2/observations?traceId=${detail!.id}&fields=core,basic,io&limit=100`)
+      const observationsV2 = page.data ?? []
+      rows = observationsV2.filter(row => row.type === 'GENERATION' || row.type === 'TOOL')
+      root = observationsV2.find(row => row.isRootObservation === true)
+      const ready = rows.length > 0
+        && rows.every(row => row.userId != null && row.userId.length > 0)
+        && root?.input != null
+        && root.output != null
+      if (ready || Date.now() >= v2Deadline) break
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
+    }
+    expect(root, 'v4 root observation').toBeDefined()
+    expect(root!.input, 'v4 root observation input').toBeDefined()
+    expect(root!.output, 'v4 root observation output').toBeDefined()
+    expect(rows.length).toBeGreaterThan(0)
+    for (const row of rows) {
+      expect(row.sessionId, `observation ${row.name ?? '?'} sessionId`).toBe(detail!.sessionId)
+      expect(row.userId, `observation ${row.name ?? '?'} userId`).toBe('dsh-plugin-langfuse-e2e')
+    }
   })
 })

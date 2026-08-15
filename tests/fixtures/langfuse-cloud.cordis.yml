@@ -29,6 +29,10 @@
     auth:
       publicKey: !!js process.env.LANGFUSE_PUBLIC_KEY
       secretKey: !!js process.env.LANGFUSE_SECRET_KEY
+    correlation:
+      # sessionId is left to its dsh-session-id default so the readback can
+      # keep querying traces by the driver-reported session ids.
+      userId: dsh-plugin-langfuse-e2e
     processor:
       # Export promptly so the driver's dispose drains a short queue.
       scheduledDelayMillis: 100

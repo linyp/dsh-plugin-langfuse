@@ -47,24 +47,43 @@ bundle 层和环境变量都在启动时读取：安装后必须重启已在运�
 | 字段 | 含义 |
 |---|---|
 | `mode` | `FULL` 实时导出每个会话；`FEEDBACK_ONLY` 仅在用户记录反馈时重放并导出 canonical 会话日志；`DISABLED`（默认）不构造任何东西，没有数据离开进程。词汇与同意语义来自 seam，与官方后端完全一致。 |
-| `exporter` | 完整的 `OTLPExporterNodeConfigBase` 对象，原样透传给 OTLP/HTTP trace exporter。非 `DISABLED` 模式下 `url` 必填，且必须是**完整的 traces 路径**（`…/api/public/otel/v1/traces`）。 |
+| `exporter` | 完整的 `OTLPExporterNodeConfigBase` 对象，传给 OTLP/HTTP trace exporter。非 `DISABLED` 模式下 `url` 必填，且必须是**完整的 traces 路径**（`…/api/public/otel/v1/traces`）。插件默认附带 `x-langfuse-ingestion-version: 4` 请求头——缺少它新 span 不会实时进入 Langfuse 的 v4 数据模型。无论显式条目来自普通 `exporter.headers` 对象还是 `HeadersFactory` 的返回值，均按任意大小写识别并优先采用。 |
 | `auth` | Langfuse 项目密钥对，转换为端点的 Basic-auth 请求头。与显式的 `exporter.headers` authorization 互斥；上传模式要求两者恰好提供其一。 |
+| `correlation` | 宿主身份关联：`userId`/`sessionId` 以 `langfuse.user.id`/`langfuse.session.id` 盖在每个导出 span 上，让嵌入方宿主的 trace 和本插件的 trace 归入同一个 Langfuse user/session。见[与嵌入宿主关联](#与嵌入宿主关联)。 |
 | `processor` | 原样透传给 `BatchSpanProcessor`（`scheduledDelayMillis`、`maxQueueSize`、`maxExportBatchSize` 等）；批处理、重试、丢失策略均为 SDK 的文档化行为。 |
 | `maxAttributeChars` | 每个 span 属性的序列化 payload 上限（默认 32768）；超长部分以 `…[clipped]` 标记裁剪，canonical 会话日志保留完整字节。 |
 | `shutdownTimeoutMillis` | 插件持有的 SDK shutdown 排水外层截止时间（默认 3000）。 |
 
-错误配置在插件加载时即失败：`url` 缺失/畸形/非 http(s)、凭据缺失、双重鉴权歧义、非正的 `maxExportBatchSize`（SDK 会在 shutdown 时挂死）、未知 `mode`，全部在构造任何传输之前抛出。
+错误配置在插件加载时即失败：`url` 缺失/畸形/非 http(s)、凭据缺失、双重鉴权歧义、非正的 `maxExportBatchSize`（SDK 会在 shutdown 时挂死）、非法的 `correlation` 结构或空的 `correlation.userId`/`sessionId`、未知 `mode`，全部在构造任何传输之前抛出。
+
+## 与嵌入宿主关联
+
+把 dsh 运行时嵌入自身、且已向同一 Langfuse 项目发送自有 trace 的宿主应用，可以操控本插件的身份标识，让两套视图归入同一个 Langfuse user/session——宿主通常在 spawn 运行时进程时以环境变量注入自己的 id：
+
+```yaml
+config:
+  correlation:
+    userId: !!js process.env.HOST_USER_ID
+    sessionId: !!js process.env.HOST_SESSION_ID
+```
+
+- 解析出的 `langfuse.session.id`/`langfuse.user.id` 会盖在**每个**导出 span 上——turn、generation、tool——因为 Langfuse v4 的查询模型按 observation 而非仅按 trace 过滤与聚合（[属性传播合约](https://langfuse.com/integrations/native/opentelemetry#important-propagating-trace-attributes-to-all-spans)）。
+- `sessionId` 默认取 dsh session id；原始 dsh session id 始终以 `dsh.session.id` 留在 turn 根 span 上——这是回查 `$DSH_HOME/sessions` 本地日志的指针。
+- **按轮动态覆盖**：`turn/start` record 上携带的 `langfuse.user.id`/`langfuse.session.id` 属性覆盖该轮的静态配置——部署方通过 `session-telemetry/record` waterfall listener 注入。快照在 `turn/start` 时锁定；之后 record 上的身份属性一律忽略。优先级：record 属性 > `correlation` 配置 > dsh session id。
+- 动态映射必须可从 dsh session id 确定性重建，且至少存活到该会话不再可能触发 `FEEDBACK_ONLY` 重放为止——否则重放出的树会带上与实时捕获不同的身份。
+- 静态 `correlation` 值不经过脱敏 waterfall：waterfall 只变换 record，而这些值从不途经 record。
+- 投递语义不变：correlation 是身份而非去重——重复仍然可能（见决策 4）。
 
 ## Langfuse 中会看到什么
 
 | dsh 会话事件 | Langfuse 概念 |
 |---|---|
-| session（`session.id`） | session（每条 trace 带 `langfuse.session.id`） |
-| `turn/start` / `turn/end` | trace（root span；错误结束原因置 span 状态为 ERROR） |
-| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** —— 模型、provider、输出、`gen_ai.usage.*` token（input/output/cache-read/reasoning） |
+| session（`session.id`） | session（每个导出的 observation/span 都带 `langfuse.session.id`） |
+| `turn/start` / `turn/end` | trace 根 observation（root span；错误结束原因置 span 状态为 ERROR） |
+| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** —— 模型、provider、输出、`gen_ai.usage.*` token（input/output/cache-read/reasoning）；最新一条 assistant message 同时成为根 observation 的整体输出 |
 | step 的首个 `assistant/chunk` | `langfuse.observation.completion_start_time`（首 token 时间） |
 | `tool/call` + `tool/result` | tool span（参数为 input，结果为 output，`isError` → 状态 ERROR） |
-| `user/message` | trace input |
+| `user/message` | 根 observation input；同时保留已弃用的 trace input，以兼容旧版 evaluator |
 | `agent-error` ops 记录 | 开放 turn 上的 exception 事件 + 状态 ERROR |
 | 其他所有事件类型（todo、plan、compaction、hooks、插件事件） | 开放 turn 上的时间点 span event |
 
@@ -95,6 +114,7 @@ seam 的记录与会话日志事件一一对应；Langfuse 需要 trace → obse
 - **`seq` 空洞是常态，绝不是丢失信号**：seam 每个 step 只发首个 `assistant/chunk`（流已启动信号；其时间即首 token 时间）。折叠器依赖这一点而非计数。
 - **severity 用 seam 预映射的值**；折叠器把 `error` 映射到 span 状态，绝不重新推导事件语义。
 - **tool span 是其 step 的 generation span 的子节点**：harness 定义 step 为一次模型请求*加上它调用的工具* —— `tool/call` 与 `tool/result` 都落在 step 边界之内 —— 因此 generation span 在时间上包含它的工具执行。step 已不再开放的调用（崩溃窗口重放）回退挂到 turn span。
+- **整轮 input/output 按 Langfuse v4 合约放在根 observation 上**：`user/message` 提供 input；每条完成的 assistant message 覆盖 output，因此 turn 结束时保留最后一条回复。已弃用的 `langfuse.trace.input/output` 别名仅用于兼容旧版 trace-level evaluator。
 - **未知事件类型落为开放 turn 上的 span event** —— 事件词汇表是 merge-extensible 的，丢弃未知类型会悄悄稀释时间线。
 - **强制收尾扫描**在三处关闭仍开放的 span（标记 `dsh.force_ended`）：新 `turn/start` 到来而前一个 turn 未闭合、会话的 ops `shutdown` 记录、后端 shutdown —— teardown 绝不把已开始的 span 遗弃在 SDK 队列里。
 
@@ -124,6 +144,8 @@ npm run build && npm run test:e2e   # REAL composition：经 Loader 启动真实
 ```
 
 e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`）：fixture `cordis.yml` 加载**构建产物** `lib/index.js` —— 与部署加载的是同一个文件 —— 断言针对 wire，而非内部实现。
+
+存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output 与逐 observation 的 user/session 关联；未提供密钥时该测试自行跳过。
 
 ## 版本兼容
 

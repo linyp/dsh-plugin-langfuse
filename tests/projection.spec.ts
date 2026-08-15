@@ -19,12 +19,12 @@ import { SessionSpanFolder } from '../src/projection.ts'
 const SESSION_ID = 'ses-test-1'
 
 /** Build one ledger record the way the seam's capture coordinator does. */
-function ledger(type: string, seq: number, time: number, body: unknown, severity: 'info' | 'warn' | 'error' = 'info'): SessionTelemetryRecord {
+function ledger(type: string, seq: number, time: number, body: unknown, severity: 'info' | 'warn' | 'error' = 'info', extraAttributes: Record<string, string | number> = {}): SessionTelemetryRecord {
   return {
     channel: 'ledger',
     time,
     severity,
-    attributes: { 'session.id': SESSION_ID, 'event.type': type, 'event.seq': seq },
+    attributes: { 'session.id': SESSION_ID, 'event.type': type, 'event.seq': seq, ...extraAttributes },
     body,
   }
 }
@@ -79,7 +79,13 @@ describe('SessionSpanFolder', () => {
     const turn = spans.get('turn 1')!
     expect(turn.parentSpanContext).toBeUndefined()
     expect(turn.attributes['langfuse.session.id']).toBe(SESSION_ID)
+    expect(turn.attributes['dsh.session.id']).toBe(SESSION_ID)
+    expect(turn.attributes['langfuse.observation.input']).toContain('run the tests')
+    expect(turn.attributes['langfuse.observation.output']).toContain('done')
+    // Deprecated aliases remain while trace-level evaluators migrate to the
+    // v4 root-observation contract.
     expect(turn.attributes['langfuse.trace.input']).toContain('run the tests')
+    expect(turn.attributes['langfuse.trace.output']).toContain('done')
     expect(turn.attributes['dsh.turn.end_reason']).toContain('completed')
     expect(millis(turn.startTime)).toBe(1_010)
     expect(millis(turn.endTime)).toBe(3_000)
@@ -87,6 +93,9 @@ describe('SessionSpanFolder', () => {
     const step = spans.get('step 0')!
     expect(step.parentSpanContext?.spanId).toBe(turn.spanContext().spanId)
     expect(step.attributes['langfuse.observation.type']).toBe('generation')
+    // Langfuse v4 filters and aggregates per observation, so identity rides
+    // every span, not only the trace root.
+    expect(step.attributes['langfuse.session.id']).toBe(SESSION_ID)
     expect(step.attributes['gen_ai.request.model']).toBe('deepseek-chat')
     expect(step.attributes['gen_ai.provider.name']).toBe('deepseek')
     expect(step.attributes['gen_ai.usage.input_tokens']).toBe(11)
@@ -102,6 +111,7 @@ describe('SessionSpanFolder', () => {
     const tool = spans.get('tool bash')!
     expect(tool.parentSpanContext?.spanId).toBe(step.spanContext().spanId)
     expect(tool.attributes['langfuse.observation.type']).toBe('tool')
+    expect(tool.attributes['langfuse.session.id']).toBe(SESSION_ID)
     expect(tool.attributes['gen_ai.tool.name']).toBe('bash')
     expect(tool.attributes['gen_ai.tool.call.id']).toBe('call-1')
     expect(tool.attributes['langfuse.observation.output']).toContain('ok')
@@ -123,6 +133,31 @@ describe('SessionSpanFolder', () => {
     expect(spans.get('turn 1')!.status.code).toBe(SpanStatusCode.ERROR)
     // No step/start was folded, so the tool span falls back to the turn parent.
     expect(spans.get('tool bash')!.parentSpanContext?.spanId).toBe(spans.get('turn 1')!.spanContext().spanId)
+  })
+
+  it('keeps the latest assistant message as the root observation output', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('step/start', 2, 1_010, { turn: 1, step: 0 }))
+    folder.fold(ledger('assistant/message', 3, 1_020, {
+      turn: 1,
+      step: 0,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'intermediate' }] },
+    }))
+    folder.fold(ledger('step/end', 4, 1_030, { turn: 1, step: 0 }))
+    folder.fold(ledger('step/start', 5, 1_040, { turn: 1, step: 1 }))
+    folder.fold(ledger('assistant/message', 6, 1_050, {
+      turn: 1,
+      step: 1,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'final answer' }] },
+    }))
+    folder.fold(ledger('step/end', 7, 1_060, { turn: 1, step: 1 }))
+    folder.fold(ledger('turn/end', 8, 1_070, { turn: 1, reason: { kind: 'completed' } }))
+
+    const spans = spansByName()
+    expect(spans.get('step 0')!.attributes['langfuse.observation.output']).toContain('intermediate')
+    expect(spans.get('step 1')!.attributes['langfuse.observation.output']).toContain('final answer')
+    expect(spans.get('turn 1')!.attributes['langfuse.observation.output']).toContain('final answer')
+    expect(spans.get('turn 1')!.attributes['langfuse.trace.output']).toContain('final answer')
   })
 
   it('stamps model identity from a request/header appended inside its own step', () => {
@@ -193,6 +228,74 @@ describe('SessionSpanFolder', () => {
       body: {},
     })
     expect(spansByName().get('turn 1')!.attributes['dsh.force_ended']).toBe(true)
+  })
+
+  it('stamps configured correlation identity on every span, keeping dsh.session.id on the root', () => {
+    const correlatedExporter = new InMemorySpanExporter()
+    const provider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(correlatedExporter)],
+    })
+    const correlated = new SessionSpanFolder(provider.getTracer('test'), {
+      correlation: { userId: 'host-user-42', sessionId: 'host-conversation-789' },
+    })
+    correlated.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    correlated.fold(ledger('step/start', 2, 1_010, { turn: 1, step: 0 }))
+    correlated.fold(ledger('tool/call', 3, 1_020, { turn: 1, step: 0, callId: 'call-1', name: 'bash', arguments: '{}' }))
+    correlated.fold(ledger('tool/result', 4, 1_030, {
+      turn: 1,
+      step: 0,
+      message: { role: 'user', content: [{ type: 'tool-result', toolCallId: 'call-1', content: [] }] },
+    }))
+    correlated.fold(ledger('step/end', 5, 1_040, { turn: 1, step: 0 }))
+    correlated.fold(ledger('turn/end', 6, 1_050, { turn: 1, reason: { kind: 'completed' } }))
+
+    const spans = new Map(correlatedExporter.getFinishedSpans().map(span => [span.name, span]))
+    const turn = spans.get('turn 1')!
+    expect(turn.attributes['langfuse.session.id']).toBe('host-conversation-789')
+    expect(turn.attributes['langfuse.user.id']).toBe('host-user-42')
+    expect(turn.attributes['dsh.session.id']).toBe(SESSION_ID)
+    // Identity rides child observations for v4 per-observation queries; the
+    // diagnostic dsh.session.id pointer stays root-only.
+    for (const name of ['step 0', 'tool bash']) {
+      const span = spans.get(name)!
+      expect(span.attributes['langfuse.session.id']).toBe('host-conversation-789')
+      expect(span.attributes['langfuse.user.id']).toBe('host-user-42')
+      expect(span.attributes['dsh.session.id']).toBeUndefined()
+    }
+  })
+
+  it('locks identity at turn/start: dynamic attributes there win, later ones are ignored', () => {
+    const correlatedExporter = new InMemorySpanExporter()
+    const provider = new BasicTracerProvider({
+      spanProcessors: [new SimpleSpanProcessor(correlatedExporter)],
+    })
+    const correlated = new SessionSpanFolder(provider.getTracer('test'), {
+      correlation: { userId: 'config-user', sessionId: 'config-session' },
+    })
+    // A deployment waterfall listener injected dynamic identity onto the
+    // turn/start record; it outranks the static config for this turn.
+    correlated.fold(ledger('turn/start', 1, 1_000, { turn: 1 }, 'info', {
+      'langfuse.user.id': 'dynamic-user',
+      'langfuse.session.id': 'dynamic-session',
+    }))
+    // Identity attributes on any later record must not reopen the snapshot.
+    correlated.fold(ledger('step/start', 2, 1_010, { turn: 1, step: 0 }, 'info', {
+      'langfuse.user.id': 'late-user',
+      'langfuse.session.id': 'late-session',
+    }))
+    correlated.fold(ledger('step/end', 3, 1_020, { turn: 1, step: 0 }))
+    correlated.fold(ledger('turn/end', 4, 1_030, { turn: 1, reason: { kind: 'completed' } }))
+    // The next turn carries no dynamic identity, so the static config resumes.
+    correlated.fold(ledger('turn/start', 5, 2_000, { turn: 2 }))
+    correlated.fold(ledger('turn/end', 6, 2_010, { turn: 2, reason: { kind: 'completed' } }))
+
+    const spans = new Map(correlatedExporter.getFinishedSpans().map(span => [span.name, span]))
+    expect(spans.get('turn 1')!.attributes['langfuse.session.id']).toBe('dynamic-session')
+    expect(spans.get('turn 1')!.attributes['langfuse.user.id']).toBe('dynamic-user')
+    expect(spans.get('step 0')!.attributes['langfuse.session.id']).toBe('dynamic-session')
+    expect(spans.get('step 0')!.attributes['langfuse.user.id']).toBe('dynamic-user')
+    expect(spans.get('turn 2')!.attributes['langfuse.session.id']).toBe('config-session')
+    expect(spans.get('turn 2')!.attributes['langfuse.user.id']).toBe('config-user')
   })
 
   it('clips oversized payloads at the configured attribute budget', () => {

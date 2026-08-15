@@ -28,9 +28,9 @@ import { APP_IDENTITY } from '@deepseek-ai/dsh-llm'
 import type { OTLPExporterNodeConfigBase } from '@opentelemetry/otlp-exporter-base'
 import type { BufferConfig } from '@opentelemetry/sdk-trace-base'
 import { buildBasicAuthHeader, buildTracerPipeline, type TracerPipeline } from './otel.ts'
-import { DEFAULT_MAX_ATTRIBUTE_CHARS, SessionSpanFolder } from './projection.ts'
+import { DEFAULT_MAX_ATTRIBUTE_CHARS, SessionSpanFolder, type CorrelationConfig } from './projection.ts'
 
-export { DEFAULT_MAX_ATTRIBUTE_CHARS }
+export { DEFAULT_MAX_ATTRIBUTE_CHARS, type CorrelationConfig }
 
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string }
 
@@ -79,7 +79,7 @@ function sharingStatusFor(mode: LangfuseTelemetryMode): SessionTelemetrySharingS
 
 /**
  * Plugin configuration: one sharing policy, the Langfuse credentials, two
- * verbatim SDK option objects, and one plugin-owned shutdown bound.
+ * SDK option objects, and one plugin-owned shutdown bound.
  * Uploading modes validate endpoint and credentials at plugin load;
  * `DISABLED` reads neither.
  */
@@ -87,9 +87,9 @@ export interface Config {
   /** Sharing policy; defaults to local-only `DISABLED` behavior. */
   mode?: LangfuseTelemetryMode
   /**
-   * Passed verbatim to the SDK's OTLP/HTTP trace exporter — the complete
-   * `OTLPExporterNodeConfigBase` shape, owned and documented by the SDK.
-   * `url` is the one field this package requires and validates itself.
+   * The complete SDK-owned `OTLPExporterNodeConfigBase` shape. The package
+   * validates `url` and defaults/wraps `headers` for Langfuse v4 ingestion;
+   * every other option passes through unchanged.
    */
   exporter?: OTLPExporterNodeConfigBase & {
     /** Full traces endpoint, e.g. `https://cloud.langfuse.com/api/public/otel/v1/traces`. Required outside `DISABLED`. */
@@ -104,6 +104,18 @@ export interface Config {
     publicKey?: string
     secretKey?: string
   }
+  /**
+   * Host-identity correlation for embedding hosts: `userId`/`sessionId` are
+   * stamped as `langfuse.user.id`/`langfuse.session.id` on every exported
+   * span so the host's own traces and this plugin's group under one Langfuse
+   * user/session. `sessionId` defaults to the dsh session id, which always
+   * stays on the turn root as `dsh.session.id`. A `turn/start` record
+   * carrying either attribute key (a deployment's `session-telemetry/record`
+   * waterfall listener injects them) overrides per turn; the resolved
+   * snapshot is locked at `turn/start`. NOTE: these static values bypass the
+   * redaction waterfall — it transforms records, and these never transit one.
+   */
+  correlation?: CorrelationConfig
   /** Passed verbatim to `BatchSpanProcessor`; the SDK owns and documents these knobs. */
   processor?: BufferConfig
   /**
@@ -119,14 +131,19 @@ export interface Config {
 
 /**
  * Schemastery validator for {@link Config}; cordis runs it before the plugin
- * starts. It checks only the top-level fields; value checks live in the
- * constructor so their errors name the fields, and the SDK option objects
- * pass through whole (re-declaring them would silently drop unlisted fields).
+ * starts. It declares the small correlation object but leaves the SDK option
+ * objects open so unlisted upstream fields are not silently dropped. Runtime
+ * value checks remain in the constructor so direct construction fails with
+ * the same field-specific errors.
  */
 export const Config: z<Config> = z.object({
   mode: z.union(Object.values(LangfuseTelemetryMode)).default(DEFAULT_TELEMETRY_MODE),
   exporter: z.any(),
   auth: z.any(),
+  correlation: z.object({
+    userId: z.string(),
+    sessionId: z.string(),
+  }),
   processor: z.any(),
   maxAttributeChars: z.number(),
   shutdownTimeoutMillis: z.number(),
@@ -186,7 +203,8 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new Error(`dsh-plugin-langfuse: exporter.url must be http(s), got ${parsed.protocol}`)
     }
-    const headers = resolveAuthHeaders(config)
+    const headers = withDefaultIngestionVersion(resolveAuthHeaders(config))
+    const correlation = validateCorrelation(config)
     const batchSize = config.processor?.maxExportBatchSize
     if (batchSize !== undefined && (!Number.isInteger(batchSize) || batchSize < 1)) {
       throw new Error(`dsh-plugin-langfuse: processor.maxExportBatchSize must be a positive integer, got ${String(batchSize)}`)
@@ -210,7 +228,7 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
       scopeName: 'dsh-plugin-langfuse',
       scopeVersion: version,
     })
-    const folder = new SessionSpanFolder(this.pipeline.tracer, { maxAttributeChars })
+    const folder = new SessionSpanFolder(this.pipeline.tracer, { maxAttributeChars, correlation })
     this.folder = folder
     const enqueue: SessionTelemetrySink['emit'] = (record: SessionTelemetryRecord) => folder.fold(record)
     const backend: SessionTelemetrySink = {
@@ -275,6 +293,49 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
       if (timer !== undefined) clearTimeout(timer)
     }
   }
+}
+
+/** Header selecting Langfuse's ingestion pipeline version. */
+const INGESTION_VERSION_HEADER = 'x-langfuse-ingestion-version'
+
+/**
+ * Default the `x-langfuse-ingestion-version: 4` header: without it, newly
+ * exported spans do not appear in real time on Langfuse's v4 data model. An
+ * explicit `exporter.headers` entry (any casing) wins. A `HeadersFactory`
+ * is wrapped so the same rule applies to the headers it resolves at export
+ * time, including rotating credentials.
+ */
+export function withDefaultIngestionVersion(headers: OTLPExporterNodeConfigBase['headers']): OTLPExporterNodeConfigBase['headers'] {
+  if (typeof headers === 'function') {
+    return async () => withDefaultIngestionVersionObject(await headers())
+  }
+  return withDefaultIngestionVersionObject(headers)
+}
+
+/** Apply the ingestion default to one resolved headers object. */
+function withDefaultIngestionVersionObject(headers: Record<string, string> | undefined): Record<string, string> {
+  const explicit = Object.keys(headers ?? {}).some(key => key.toLowerCase() === INGESTION_VERSION_HEADER)
+  if (explicit && headers !== undefined) return headers
+  return { [INGESTION_VERSION_HEADER]: '4', ...headers }
+}
+
+/**
+ * Fail loud on unusable identity values before any span carries them. These
+ * checks also protect direct construction that bypasses Cordis/Schemastery.
+ */
+function validateCorrelation(config: Config): CorrelationConfig | undefined {
+  const correlation = config.correlation
+  if (correlation === undefined) return undefined
+  if (correlation === null || typeof correlation !== 'object' || Array.isArray(correlation)) {
+    throw new Error(`dsh-plugin-langfuse: correlation must be an object with optional userId/sessionId strings, got ${JSON.stringify(correlation)}`)
+  }
+  for (const field of ['userId', 'sessionId'] as const) {
+    const value = correlation[field]
+    if (value !== undefined && (typeof value !== 'string' || value.length === 0)) {
+      throw new Error(`dsh-plugin-langfuse: correlation.${field} must be a non-empty string, got ${JSON.stringify(value)}`)
+    }
+  }
+  return correlation
 }
 
 /**

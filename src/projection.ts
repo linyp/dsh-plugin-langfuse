@@ -14,6 +14,14 @@
  * semantics; records may repeat after a cursor-less re-adoption, so
  * duplicate spans are possible downstream (see README: delivery semantics).
  *
+ * Identity correlation: `langfuse.session.id`/`langfuse.user.id` resolve once
+ * per turn — dynamic attributes on the `turn/start` record win over the
+ * static {@link CorrelationConfig}, which wins over the dsh session id — and
+ * the snapshot is locked for the whole turn: identity attributes on later
+ * records are ignored. Langfuse's v4 query model filters per observation, so
+ * the resolved identity rides every span; the original dsh session id stays
+ * on the turn root as `dsh.session.id`.
+ *
  * @module dsh-plugin-langfuse/projection
  */
 
@@ -30,6 +38,7 @@ import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
 import {
   ATTR_DSH_EVENT_SEQ,
   ATTR_DSH_FORCE_ENDED,
+  ATTR_DSH_SESSION_ID,
   ATTR_DSH_STEP,
   ATTR_DSH_TURN,
   ATTR_DSH_TURN_END_REASON,
@@ -48,6 +57,8 @@ import {
   ATTR_LANGFUSE_SESSION_ID,
   ATTR_LANGFUSE_TRACE_INPUT,
   ATTR_LANGFUSE_TRACE_NAME,
+  ATTR_LANGFUSE_TRACE_OUTPUT,
+  ATTR_LANGFUSE_USER_ID,
 } from './semconv.ts'
 
 /**
@@ -62,6 +73,41 @@ export const DEFAULT_MAX_ATTRIBUTE_CHARS = 32_768
 function clip(value: unknown, budget: number): string {
   const text = JSON.stringify(value) ?? 'null'
   return text.length <= budget ? text : `${text.slice(0, budget)}…[clipped]`
+}
+
+/**
+ * Static identity correlation for embedding hosts: values stamped as
+ * `langfuse.user.id` / `langfuse.session.id` on every exported span so a
+ * host's own traces and this plugin's group under one Langfuse user/session.
+ * A `turn/start` record carrying either attribute key overrides per turn.
+ */
+export interface CorrelationConfig {
+  /** Langfuse user identity; absent means no `langfuse.user.id` is emitted. */
+  userId?: string
+  /** Langfuse session identity; absent means the dsh session id. */
+  sessionId?: string
+}
+
+/** The identity snapshot resolved at `turn/start` and locked for the turn. */
+interface TurnCorrelation {
+  userId?: string
+  langfuseSessionId: string
+  dshSessionId: string
+}
+
+/** The `langfuse.*` identity every span carries for v4 per-observation queries. */
+function identityAttributes(correlation: TurnCorrelation): Record<string, string> {
+  return {
+    [ATTR_LANGFUSE_SESSION_ID]: correlation.langfuseSessionId,
+    ...correlation.userId === undefined ? {} : { [ATTR_LANGFUSE_USER_ID]: correlation.userId },
+  }
+}
+
+/** Read one dynamic identity attribute from a record; empty values mean absent. */
+function dynamicAttr(value: string | number | undefined): string | undefined {
+  if (value === undefined) return undefined
+  const text = String(value)
+  return text.length === 0 ? undefined : text
 }
 
 interface StepState {
@@ -81,6 +127,8 @@ interface TurnState {
   tools: Map<string, Span>
   /** The step currently between `step/start` and `step/end`, if any. */
   currentStep?: StepState
+  /** Identity locked at `turn/start`; later records cannot change it. */
+  correlation: TurnCorrelation
 }
 
 interface SessionState {
@@ -102,9 +150,26 @@ function body<T extends keyof SessionEventMap>(record: SessionTelemetryRecord): 
 export class SessionSpanFolder {
   private readonly sessions = new Map<string, SessionState>()
   private readonly maxAttributeChars: number
+  private readonly correlation: CorrelationConfig | undefined
 
-  constructor(private readonly tracer: Tracer, options?: { maxAttributeChars?: number }) {
+  constructor(private readonly tracer: Tracer, options?: { maxAttributeChars?: number; correlation?: CorrelationConfig }) {
     this.maxAttributeChars = options?.maxAttributeChars ?? DEFAULT_MAX_ATTRIBUTE_CHARS
+    this.correlation = options?.correlation
+  }
+
+  /**
+   * Resolve the turn's identity snapshot: dynamic attributes on the
+   * `turn/start` record (a deployment's `session-telemetry/record` waterfall
+   * listener injects them) win over the static config, which wins over the
+   * dsh session id.
+   */
+  private resolveCorrelation(record: SessionTelemetryRecord, dshSessionId: string): TurnCorrelation {
+    return {
+      langfuseSessionId: dynamicAttr(record.attributes[ATTR_LANGFUSE_SESSION_ID])
+        ?? this.correlation?.sessionId ?? dshSessionId,
+      userId: dynamicAttr(record.attributes[ATTR_LANGFUSE_USER_ID]) ?? this.correlation?.userId,
+      dshSessionId,
+    }
   }
 
   /** Serialize a payload for a span attribute within this folder's budget. */
@@ -144,11 +209,13 @@ export class SessionSpanFolder {
         // A still-open previous turn means its turn/end never shipped
         // (crash window or dropped record); close it before opening the next.
         if (state.turn !== undefined) this.endTurn(state, record.time, true)
+        const correlation = this.resolveCorrelation(record, sessionId)
         const span = this.tracer.startSpan(`turn ${turn}`, {
           startTime: record.time,
           root: true,
           attributes: {
-            [ATTR_LANGFUSE_SESSION_ID]: sessionId,
+            ...identityAttributes(correlation),
+            [ATTR_DSH_SESSION_ID]: correlation.dshSessionId,
             [ATTR_LANGFUSE_TRACE_NAME]: `dsh turn ${turn}`,
             [ATTR_DSH_TURN]: turn,
             [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
@@ -160,11 +227,19 @@ export class SessionSpanFolder {
           turn,
           steps: new Map(),
           tools: new Map(),
+          correlation,
         }
         return
       }
       case 'user/message': {
-        state.turn?.span.setAttribute(ATTR_LANGFUSE_TRACE_INPUT, this.clip(record.body))
+        const input = this.clip(record.body)
+        // V4 has no separate trace input: the overall request belongs to the
+        // root observation. Retain the legacy attribute for trace-level
+        // evaluators while they migrate.
+        state.turn?.span.setAttributes({
+          [ATTR_LANGFUSE_OBSERVATION_INPUT]: input,
+          [ATTR_LANGFUSE_TRACE_INPUT]: input,
+        })
         return
       }
       case 'step/start': {
@@ -174,6 +249,7 @@ export class SessionSpanFolder {
           startTime: record.time,
           attributes: {
             [ATTR_LANGFUSE_OBSERVATION_TYPE]: 'generation',
+            ...identityAttributes(state.turn.correlation),
             [ATTR_DSH_TURN]: turn,
             [ATTR_DSH_STEP]: step,
             [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
@@ -202,7 +278,15 @@ export class SessionSpanFolder {
         const { step, message, usage } = body<'assistant/message'>(record)
         const stepState = state.turn?.steps.get(step)
         if (stepState === undefined) return
-        stepState.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, this.clip(message))
+        const output = this.clip(message)
+        stepState.span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, output)
+        // Each completed assistant message replaces the turn root's output;
+        // after the final step this is the overall turn response. Keep the
+        // deprecated trace attribute only for legacy evaluator compatibility.
+        state.turn?.span.setAttributes({
+          [ATTR_LANGFUSE_OBSERVATION_OUTPUT]: output,
+          [ATTR_LANGFUSE_TRACE_OUTPUT]: output,
+        })
         if (usage !== undefined) {
           stepState.span.setAttribute(ATTR_GEN_AI_USAGE_INPUT_TOKENS, usage.inputTokens)
           stepState.span.setAttribute(ATTR_GEN_AI_USAGE_OUTPUT_TOKENS, usage.outputTokens)
@@ -236,6 +320,7 @@ export class SessionSpanFolder {
           startTime: record.time,
           attributes: {
             [ATTR_LANGFUSE_OBSERVATION_TYPE]: 'tool',
+            ...identityAttributes(state.turn.correlation),
             [ATTR_GEN_AI_TOOL_NAME]: name,
             [ATTR_GEN_AI_TOOL_CALL_ID]: String(callId),
             [ATTR_LANGFUSE_OBSERVATION_INPUT]: this.clip(args),

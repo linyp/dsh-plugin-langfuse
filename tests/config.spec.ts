@@ -13,6 +13,7 @@ import {
   DEFAULT_TELEMETRY_MODE,
   LangfuseSessionTelemetryBackend,
   LangfuseTelemetryMode,
+  withDefaultIngestionVersion,
   type Config,
 } from '../src/index.ts'
 
@@ -94,6 +95,65 @@ describe('config validation', () => {
   it('rejects an unknown mode smuggled past the schema by direct construction', () => {
     expect(() => construct({ mode: 'EVERYTHING' as LangfuseTelemetryMode }))
       .toThrow(/unsupported mode/)
+  })
+
+  it('rejects an empty correlation.userId', () => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.FULL,
+      auth: AUTH,
+      exporter: { url: URL_OK },
+      correlation: { userId: '' },
+    })).toThrow(/correlation\.userId/)
+  })
+
+  it('rejects a non-string correlation.sessionId', () => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.FULL,
+      auth: AUTH,
+      exporter: { url: URL_OK },
+      correlation: { sessionId: 42 as unknown as string },
+    })).toThrow(/correlation\.sessionId/)
+  })
+
+  it.each([null, 'host-user', 42, []])('rejects a non-object correlation shape: %j', (correlation) => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.FULL,
+      auth: AUTH,
+      exporter: { url: URL_OK },
+      correlation: correlation as unknown as Config['correlation'],
+    })).toThrow(/correlation must be an object/)
+  })
+})
+
+describe('withDefaultIngestionVersion', () => {
+  it('defaults the v4 ingestion header so new spans land on the v4 data model', () => {
+    expect(withDefaultIngestionVersion({ authorization: 'Basic abc' }))
+      .toEqual({ 'x-langfuse-ingestion-version': '4', authorization: 'Basic abc' })
+  })
+
+  it('yields to an explicit entry regardless of casing', () => {
+    const explicit = { 'X-Langfuse-Ingestion-Version': '3', authorization: 'Basic abc' }
+    expect(withDefaultIngestionVersion(explicit)).toBe(explicit)
+  })
+
+  it('wraps a HeadersFactory and defaults the resolved headers', async () => {
+    const factory = async () => ({ authorization: 'Basic abc' })
+    const wrapped = withDefaultIngestionVersion(factory)
+    expect(wrapped).not.toBe(factory)
+    expect(typeof wrapped).toBe('function')
+    await expect((wrapped as typeof factory)()).resolves.toEqual({
+      'x-langfuse-ingestion-version': '4',
+      authorization: 'Basic abc',
+    })
+  })
+
+  it('preserves an explicit ingestion version resolved by a HeadersFactory', async () => {
+    const factory = async () => ({
+      authorization: 'Basic abc',
+      'X-Langfuse-Ingestion-Version': '3',
+    })
+    const wrapped = withDefaultIngestionVersion(factory)
+    await expect((wrapped as typeof factory)()).resolves.toEqual(await factory())
   })
 })
 

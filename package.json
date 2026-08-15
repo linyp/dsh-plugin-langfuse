@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-langfuse",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Langfuse observability for DeepSeek Harness: exports session logs as OpenTelemetry traces (GenAI semantic conventions) to Langfuse's OTLP endpoint",
   "type": "module",
   "main": "lib/index.js",

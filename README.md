@@ -47,24 +47,43 @@ Or as an explicit `cordis.yml` row:
 | Field | Meaning |
 |---|---|
 | `mode` | `FULL` exports every session live; `FEEDBACK_ONLY` replays and exports the canonical session log only when the user records feedback; `DISABLED` (default) constructs nothing and nothing leaves the process. The vocabulary and consent semantics are the seam's, identical to the official backend. |
-| `exporter` | The complete `OTLPExporterNodeConfigBase` object, passed verbatim to the OTLP/HTTP trace exporter. `url` is required outside `DISABLED` and must be the **full traces path** (`…/api/public/otel/v1/traces`). |
+| `exporter` | The complete `OTLPExporterNodeConfigBase` object, passed to the OTLP/HTTP trace exporter. `url` is required outside `DISABLED` and must be the **full traces path** (`…/api/public/otel/v1/traces`). The plugin defaults an `x-langfuse-ingestion-version: 4` header — without it new spans do not land on Langfuse's v4 data model in real time. An explicit entry (any casing) wins, whether supplied in a plain `exporter.headers` object or returned by a `HeadersFactory`. |
 | `auth` | Langfuse project key pair, turned into the endpoint's Basic-auth header. Mutually exclusive with an explicit `exporter.headers` authorization; uploading modes require exactly one of the two. |
+| `correlation` | Host-identity correlation: `userId`/`sessionId` stamped as `langfuse.user.id`/`langfuse.session.id` on every exported span so an embedding host's traces and this plugin's group under one Langfuse user/session. See [Correlating with an embedding host](#correlating-with-an-embedding-host). |
 | `processor` | Passed verbatim to `BatchSpanProcessor` (`scheduledDelayMillis`, `maxQueueSize`, `maxExportBatchSize`, …); batching, retry, and loss policy are the SDK's documented behavior. |
 | `maxAttributeChars` | Serialized-payload ceiling per span attribute (default 32768); longer payloads are clipped with an `…[clipped]` marker while the canonical session log keeps the full bytes. |
 | `shutdownTimeoutMillis` | Plugin-owned outer deadline on the SDK's shutdown drain (default 3000). |
 
-Misconfiguration fails loud at plugin load: a missing/malformed/non-http(s) `url`, missing credentials, ambiguous double auth, a non-positive `maxExportBatchSize` (the SDK would hang on shutdown), or an unknown `mode` all throw before any transport is constructed.
+Misconfiguration fails loud at plugin load: a missing/malformed/non-http(s) `url`, missing credentials, ambiguous double auth, a non-positive `maxExportBatchSize` (the SDK would hang on shutdown), an invalid `correlation` shape or empty `correlation.userId`/`sessionId`, or an unknown `mode` all throw before any transport is constructed.
+
+## Correlating with an embedding host
+
+A host application that embeds the dsh runtime and already emits its own traces into the same Langfuse project can steer this plugin's identity so both views group under one Langfuse user/session — the host typically injects its ids as env vars when spawning the runtime:
+
+```yaml
+config:
+  correlation:
+    userId: !!js process.env.HOST_USER_ID
+    sessionId: !!js process.env.HOST_SESSION_ID
+```
+
+- The resolved `langfuse.session.id`/`langfuse.user.id` ride **every** exported span — turn, generation, and tool — because Langfuse's v4 query model filters and aggregates per observation, not only per trace ([propagation contract](https://langfuse.com/integrations/native/opentelemetry#important-propagating-trace-attributes-to-all-spans)).
+- `sessionId` defaults to the dsh session id, and the original dsh session id always stays on the turn root as `dsh.session.id` — the pointer back into `$DSH_HOME/sessions` for local diagnosis.
+- **Per-turn dynamic override**: a `turn/start` record carrying `langfuse.user.id`/`langfuse.session.id` attributes overrides the static config for that turn — a deployment injects them through a `session-telemetry/record` waterfall listener. The snapshot is locked at `turn/start`; identity attributes on later records are ignored. Precedence: record attributes > `correlation` config > dsh session id.
+- A dynamic mapping must be deterministic and rebuildable from the dsh session id, and must survive for as long as the session can still trigger a `FEEDBACK_ONLY` replay — otherwise the replayed tree exports under a different identity than live capture would have.
+- Static `correlation` values bypass the redaction waterfall: the waterfall transforms records, and these values never transit one.
+- Delivery semantics are unchanged: correlation is identity, not dedup — duplicates remain possible (see decision 4).
 
 ## What appears in Langfuse
 
 | dsh session event | Langfuse concept |
 |---|---|
-| session (`session.id`) | session (`langfuse.session.id` on every trace) |
-| `turn/start` / `turn/end` | trace (root span; error end reasons set span status ERROR) |
-| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** — model, provider, output, `gen_ai.usage.*` tokens (input/output/cache-read/reasoning) |
+| session (`session.id`) | session (`langfuse.session.id` on every exported observation/span) |
+| `turn/start` / `turn/end` | trace root observation (root span; error end reasons set span status ERROR) |
+| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** — model, provider, output, `gen_ai.usage.*` tokens (input/output/cache-read/reasoning); the latest assistant message also becomes the root observation's overall output |
 | first `assistant/chunk` of a step | `langfuse.observation.completion_start_time` (time-to-first-token) |
 | `tool/call` + `tool/result` | tool span (arguments as input, result as output, `isError` → status ERROR) |
-| `user/message` | trace input |
+| `user/message` | root observation input; deprecated trace input is retained for legacy evaluator compatibility |
 | `agent-error` ops record | exception event + status ERROR on the open turn |
 | every other event type (todo, plan, compaction, hooks, plugin events) | point-in-time span event on the open turn |
 
@@ -95,6 +114,7 @@ The seam's records mirror session-log events one-to-one; Langfuse needs trace �
 - **`seq` gaps are routine, never a loss signal**: the seam ships only the first `assistant/chunk` per step (the stream-started signal; its time is the first-token time). The folder relies on this instead of counting.
 - **Severity is the seam's pre-mapped value**; the folder maps `error` onto span status and never re-derives event semantics.
 - **Tool spans are children of their step's generation span**: the harness defines a step as one model request *plus the tools it calls* — `tool/call` and `tool/result` land inside the step's boundaries — so the generation span temporally contains its tool executions. A call whose step is no longer open (crash-window replay) falls back to the turn span.
+- **Overall turn input/output live on the root observation for Langfuse v4**: `user/message` supplies its input, and each completed assistant message replaces its output so the final message remains at turn end. Deprecated `langfuse.trace.input/output` aliases are emitted only for legacy trace-level evaluator compatibility.
 - **Unknown event types land as span events on the open turn** — the event vocabulary is merge-extensible, and dropping unknown types would silently thin the timeline.
 - **Force-end sweeps** close still-open spans (marked `dsh.force_ended`) on a next `turn/start` with an open predecessor, on the session's ops `shutdown` record, and on backend shutdown — teardown never abandons started spans inside the SDK queue.
 
@@ -124,6 +144,8 @@ npm run build && npm run test:e2e   # REAL composition: boots a real dsh app via
 ```
 
 The e2e follows the official repository's REAL-composition pattern (`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`): the fixture `cordis.yml` loads the **built** `lib/index.js` — the same file a deployment loads — and assertions run against the wire, not against internals.
+
+When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output and per-observation user/session correlation. Without keys, that test self-skips.
 
 ## Version compatibility
 
