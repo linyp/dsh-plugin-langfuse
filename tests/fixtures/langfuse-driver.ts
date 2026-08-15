@@ -2,7 +2,7 @@
 /**
  * Test driver: start a mock Langfuse OTLP collector, boot the fixture Loader
  * composition against it, run one mocked-model turn with a real bash round
- * trip, then persist everything the collector captured to
+ * trip, fork a child with one live turn, then persist everything captured to
  * `./otlp-captures.json` for the e2e's inspect step. Erasable-syntax
  * TypeScript only: runs under plain Node type stripping.
  */
@@ -53,6 +53,11 @@ try {
   const session = ctx.get('sessions')?.list()[0]
   if (session === undefined) throw new Error('langfuse driver saw no session after the fixture turn')
   recordFeedback(session, 'e2e feedback score')
+  // Exercise the real SessionStore fork path: inherited seed rows are not
+  // re-emitted, while every live child row carries parent/seed attributes.
+  const child = ctx.sessions.fork(session)
+  child.append('turn/start', { turn: 2 })
+  child.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
 } finally {
   await ctx.fiber.dispose()
 }

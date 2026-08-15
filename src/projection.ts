@@ -44,7 +44,12 @@ import { TRACEPARENT_ATTRIBUTE, TRACESTATE_ATTRIBUTE } from './identity.ts'
 import {
   ATTR_DSH_EVENT_SEQ,
   ATTR_DSH_FORCE_ENDED,
+  ATTR_DSH_LINEAGE_LINKED,
+  ATTR_DSH_LINEAGE_PARENT_TRACE_ID,
+  ATTR_DSH_LINK_TYPE,
   ATTR_DSH_SESSION_ID,
+  ATTR_DSH_SESSION_PARENT_ID,
+  ATTR_DSH_SESSION_SEED_LENGTH,
   ATTR_DSH_STEP,
   ATTR_DSH_TRACE_DETERMINISTIC_ID,
   ATTR_DSH_TRACE_LOGICAL_ROOT,
@@ -62,6 +67,9 @@ import {
   ATTR_LANGFUSE_SESSION_ID,
   ATTR_LANGFUSE_TRACE_INPUT,
   ATTR_LANGFUSE_TRACE_METADATA_DSH_DETERMINISTIC_TRACE_ID,
+  ATTR_LANGFUSE_TRACE_METADATA_DSH_PARENT_SESSION_ID,
+  ATTR_LANGFUSE_TRACE_METADATA_DSH_PARENT_TRACE_ID,
+  ATTR_LANGFUSE_TRACE_METADATA_DSH_SEED_LENGTH,
   ATTR_LANGFUSE_TRACE_NAME,
   ATTR_LANGFUSE_TRACE_OUTPUT,
   ATTR_LANGFUSE_USER_ID,
@@ -119,6 +127,17 @@ function dynamicAttr(value: string | number | undefined): string | undefined {
   if (value === undefined) return undefined
   const text = String(value)
   return text.length === 0 ? undefined : text
+}
+
+/** Parse one non-empty string identity attribute without coercion. */
+function stringAttr(value: string | number | undefined): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
+/** Parse one non-negative integer identity attribute without throwing. */
+function nonNegativeIntegerAttr(value: string | number | undefined): number | undefined {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) return undefined
+  return value
 }
 
 interface StepState {
@@ -236,17 +255,45 @@ export class SessionSpanFolder {
           turn,
           startSeq: Number(record.attributes['event.seq']),
           langfuseSessionId: correlation.langfuseSessionId,
+          parentId: stringAttr(record.attributes['session.parent_id']),
+          seedLength: nonNegativeIntegerAttr(record.attributes['session.seed_length']),
           traceparent: record.attributes[TRACEPARENT_ATTRIBUTE],
           tracestate: record.attributes[TRACESTATE_ATTRIBUTE],
         })
+        const lineage = this.identityRegistry.resolveForkLink(sessionId)
         const span = this.tracer.startSpan(`turn ${turn}`, {
           startTime: record.time,
+          ...lineage?.parentSpanContext === undefined ? {} : {
+            links: [{
+              context: lineage.parentSpanContext,
+              attributes: {
+                [ATTR_DSH_LINK_TYPE]: 'fork',
+                ...lineage.parentId === undefined ? {} : { [ATTR_DSH_SESSION_PARENT_ID]: lineage.parentId },
+                ...lineage.seedLength === undefined ? {} : { [ATTR_DSH_SESSION_SEED_LENGTH]: lineage.seedLength },
+              },
+            }],
+          },
           attributes: {
             ...identityAttributes(correlation, identity),
             [ATTR_DSH_SESSION_ID]: correlation.dshSessionId,
             [ATTR_DSH_TRACE_LOGICAL_ROOT]: true,
             [ATTR_LANGFUSE_INTERNAL_IS_APP_ROOT]: true,
             [ATTR_LANGFUSE_TRACE_NAME]: `dsh turn ${turn}`,
+            ...lineage === undefined ? {} : {
+              [ATTR_DSH_LINEAGE_LINKED]: lineage.linked,
+              ...lineage.parentId === undefined ? {} : {
+                [ATTR_DSH_SESSION_PARENT_ID]: lineage.parentId,
+                [ATTR_LANGFUSE_TRACE_METADATA_DSH_PARENT_SESSION_ID]: lineage.parentId,
+              },
+              ...lineage.seedLength === undefined ? {} : {
+                [ATTR_DSH_SESSION_SEED_LENGTH]: lineage.seedLength,
+                [ATTR_LANGFUSE_TRACE_METADATA_DSH_SEED_LENGTH]: lineage.seedLength,
+              },
+              ...lineage.parentTraceId === undefined ? {} : {
+                [ATTR_DSH_LINEAGE_PARENT_TRACE_ID]: lineage.parentTraceId,
+                [ATTR_LANGFUSE_TRACE_METADATA_DSH_PARENT_TRACE_ID]: lineage.parentTraceId,
+              },
+            },
             [ATTR_DSH_TURN]: turn,
             [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
           },

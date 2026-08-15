@@ -1,6 +1,6 @@
 /**
- * Bounded in-process identity index shared by trace projection and future
- * Score/lineage sinks. It is correlation state, never a replacement for the
+ * Bounded in-process identity index shared by trace projection, Score mapping,
+ * and fork-lineage resolution. It is correlation state, never a replacement for the
  * canonical DSH event log.
  *
  * @module dsh-plugin-langfuse/identity-registry
@@ -20,6 +20,9 @@ export interface BeginTurnIdentity {
   turn: number
   startSeq: number
   langfuseSessionId: string
+  /** Immutable fork lineage copied from the DSH session header, when present. */
+  parentId?: string
+  seedLength?: number
   traceparent?: string | number
   tracestate?: string | number
 }
@@ -41,6 +44,20 @@ interface SessionIdentity {
   latestLangfuseSessionId: string
   ambiguousLangfuseSession: boolean
   turns: Map<number, TurnIdentity>
+  parentId?: string
+  seedLength?: number
+}
+
+/** Best-effort resolution of one child session's direct fork boundary. */
+export interface ForkLinkResolution {
+  parentId?: string
+  seedLength?: number
+  /** Trace ID of the latest completed parent turn before the seed boundary. */
+  parentTraceId?: string
+  /** Exported parent root context used to construct an OTel Link. */
+  parentSpanContext?: SpanContext
+  /** True exactly when `parentSpanContext` is available for a real Link. */
+  linked: boolean
 }
 
 /** Session-level subject state consumed by the feedback Score mapper. */
@@ -87,6 +104,8 @@ export class TelemetryIdentityRegistry {
         latestLangfuseSessionId: input.langfuseSessionId,
         ambiguousLangfuseSession: false,
         turns: new Map(),
+        ...input.parentId === undefined ? {} : { parentId: input.parentId },
+        ...input.seedLength === undefined ? {} : { seedLength: input.seedLength },
       }
       this.sessions.set(input.dshSessionId, session)
       this.evictSessionsIfNeeded()
@@ -94,6 +113,11 @@ export class TelemetryIdentityRegistry {
       // Touch the session in insertion-ordered Map LRU.
       this.sessions.delete(input.dshSessionId)
       this.sessions.set(input.dshSessionId, session)
+      // Header lineage is immutable upstream. Preserve the first valid value,
+      // while allowing a later post-waterfall record to fill a field that an
+      // earlier policy removed.
+      if (session.parentId === undefined && input.parentId !== undefined) session.parentId = input.parentId
+      if (session.seedLength === undefined && input.seedLength !== undefined) session.seedLength = input.seedLength
     }
 
     const existing = session.turns.get(input.turn)
@@ -145,7 +169,7 @@ export class TelemetryIdentityRegistry {
     return this.sessions.get(dshSessionId)?.turns.get(turn)
   }
 
-  /** Future Score mapping uses the most recently resolved per-turn subject. */
+  /** Score mapping uses the most recently resolved per-turn subject. */
   getLatestLangfuseSessionId(dshSessionId: string): string | undefined {
     return this.sessions.get(dshSessionId)?.latestLangfuseSessionId
   }
@@ -156,6 +180,42 @@ export class TelemetryIdentityRegistry {
     return {
       langfuseSessionId: session?.latestLangfuseSessionId,
       ambiguous: session?.ambiguousLangfuseSession ?? false,
+    }
+  }
+
+  /**
+   * Resolve the latest completed parent turn strictly before the child's
+   * inherited seed boundary. Missing/evicted state keeps raw lineage but never
+   * fabricates a SpanContext.
+   */
+  resolveForkLink(dshSessionId: string): ForkLinkResolution | undefined {
+    const child = this.sessions.get(dshSessionId)
+    if (child === undefined || (child.parentId === undefined && child.seedLength === undefined)) return undefined
+
+    const base: ForkLinkResolution = {
+      ...child.parentId === undefined ? {} : { parentId: child.parentId },
+      ...child.seedLength === undefined ? {} : { seedLength: child.seedLength },
+      linked: false,
+    }
+    if (child.parentId === undefined || child.seedLength === undefined || child.parentId === dshSessionId) return base
+
+    const parent = this.sessions.get(child.parentId)
+    if (parent === undefined) return base
+    let boundaryTurn: TurnIdentity | undefined
+    for (const candidate of parent.turns.values()) {
+      if (candidate.endSeq === undefined || candidate.endSeq >= child.seedLength) continue
+      const previousEndSeq = boundaryTurn?.endSeq
+      if (previousEndSeq === undefined || candidate.endSeq > previousEndSeq) boundaryTurn = candidate
+    }
+    if (boundaryTurn === undefined) return base
+
+    return {
+      ...base,
+      parentTraceId: boundaryTurn.traceId,
+      ...boundaryTurn.rootSpanContext === undefined ? {} : {
+        parentSpanContext: boundaryTurn.rootSpanContext,
+        linked: true,
+      },
     }
   }
 

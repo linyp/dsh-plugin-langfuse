@@ -179,4 +179,158 @@ describe('TelemetryIdentityRegistry', () => {
     expect(warnings[0]).toMatch(/invalid W3C trace context/)
     expect(warnings[1]).toMatch(/memory bound/)
   })
+
+  it('resolves the latest completed parent turn before the fork seed boundary', () => {
+    const registry = new TelemetryIdentityRegistry()
+    const first = registry.beginTurn({
+      dshSessionId: 'parent', turn: 1, startSeq: 1, langfuseSessionId: 'parent',
+    })
+    const firstContext = {
+      traceId: first.traceId,
+      spanId: '1111111111111111',
+      traceFlags: TraceFlags.SAMPLED,
+    }
+    registry.registerRootSpan(first, firstContext)
+    registry.completeTurn(first, { endSeq: 5, forced: false })
+    const second = registry.beginTurn({
+      dshSessionId: 'parent', turn: 2, startSeq: 6, langfuseSessionId: 'parent',
+    })
+    registry.registerRootSpan(second, {
+      traceId: second.traceId,
+      spanId: '2222222222222222',
+      traceFlags: TraceFlags.SAMPLED,
+    })
+    registry.completeTurn(second, { endSeq: 10, forced: false })
+
+    registry.beginTurn({
+      dshSessionId: 'child',
+      turn: 2,
+      startSeq: 7,
+      langfuseSessionId: 'child',
+      parentId: 'parent',
+      seedLength: 6,
+    })
+    expect(registry.resolveForkLink('child')).toEqual({
+      parentId: 'parent',
+      seedLength: 6,
+      parentTraceId: first.traceId,
+      parentSpanContext: firstContext,
+      linked: true,
+    })
+  })
+
+  it('keeps raw lineage across resume and degrades safely when the parent is missing or evicted', () => {
+    const missing = new TelemetryIdentityRegistry()
+    missing.beginTurn({
+      dshSessionId: 'child',
+      turn: 2,
+      startSeq: 7,
+      langfuseSessionId: 'child',
+      parentId: 'absent-parent',
+      seedLength: 6,
+    })
+    expect(missing.resolveForkLink('child')).toEqual({
+      parentId: 'absent-parent', seedLength: 6, linked: false,
+    })
+    // A resumed/later turn can omit the repeated attributes without losing
+    // the session's immutable lineage snapshot.
+    missing.beginTurn({
+      dshSessionId: 'child', turn: 3, startSeq: 9, langfuseSessionId: 'child',
+    })
+    expect(missing.resolveForkLink('child')).toEqual({
+      parentId: 'absent-parent', seedLength: 6, linked: false,
+    })
+
+    const evicted = new TelemetryIdentityRegistry({ maxSessions: 1 })
+    const parent = evicted.beginTurn({
+      dshSessionId: 'parent', turn: 1, startSeq: 1, langfuseSessionId: 'parent',
+    })
+    evicted.registerRootSpan(parent, {
+      traceId: parent.traceId,
+      spanId: '1111111111111111',
+      traceFlags: TraceFlags.SAMPLED,
+    })
+    evicted.completeTurn(parent, { endSeq: 5, forced: false })
+    evicted.beginTurn({
+      dshSessionId: 'child',
+      turn: 2,
+      startSeq: 7,
+      langfuseSessionId: 'child',
+      parentId: 'parent',
+      seedLength: 6,
+    })
+    expect(evicted.resolveForkLink('child')).toEqual({
+      parentId: 'parent', seedLength: 6, linked: false,
+    })
+
+    // Turn-level eviction must not substitute a newer, ineligible parent turn
+    // or a completed turn from an unrelated session.
+    const turnEvicted = new TelemetryIdentityRegistry({ maxTurnsPerSession: 1 })
+    const finish = (dshSessionId: string, turn: number, endSeq: number) => {
+      const identity = turnEvicted.beginTurn({
+        dshSessionId, turn, startSeq: endSeq - 1, langfuseSessionId: dshSessionId,
+      })
+      turnEvicted.registerRootSpan(identity, {
+        traceId: identity.traceId,
+        spanId: String(turn).padStart(16, dshSessionId === 'parent' ? '3' : '4'),
+        traceFlags: TraceFlags.SAMPLED,
+      })
+      turnEvicted.completeTurn(identity, { endSeq, forced: false })
+    }
+    finish('parent', 1, 5)
+    finish('parent', 2, 10)
+    finish('unrelated', 1, 5)
+    turnEvicted.beginTurn({
+      dshSessionId: 'bounded-child',
+      turn: 2,
+      startSeq: 7,
+      langfuseSessionId: 'bounded-child',
+      parentId: 'parent',
+      seedLength: 6,
+    })
+    expect(turnEvicted.resolveForkLink('bounded-child')).toEqual({
+      parentId: 'parent', seedLength: 6, linked: false,
+    })
+  })
+
+  it('builds nested fork lineage one direct parent at a time', () => {
+    const registry = new TelemetryIdentityRegistry()
+    const complete = (dshSessionId: string, turn: number, startSeq: number, endSeq: number, lineage?: { parentId: string; seedLength: number }) => {
+      const identity = registry.beginTurn({
+        dshSessionId,
+        turn,
+        startSeq,
+        langfuseSessionId: dshSessionId,
+        ...lineage,
+      })
+      registry.registerRootSpan(identity, {
+        traceId: identity.traceId,
+        spanId: String(turn).padStart(16, dshSessionId === 'parent' ? '1' : '2'),
+        traceFlags: TraceFlags.SAMPLED,
+      })
+      registry.completeTurn(identity, { endSeq, forced: false })
+      return identity
+    }
+
+    const parent = complete('parent', 1, 1, 5)
+    const child = complete('child', 2, 7, 10, { parentId: 'parent', seedLength: 6 })
+    registry.beginTurn({
+      dshSessionId: 'grandchild',
+      turn: 3,
+      startSeq: 12,
+      langfuseSessionId: 'grandchild',
+      parentId: 'child',
+      seedLength: 11,
+    })
+
+    expect(registry.resolveForkLink('child')?.parentTraceId).toBe(parent.traceId)
+    const grandchild = registry.resolveForkLink('grandchild')
+    expect(grandchild).toMatchObject({
+      parentId: 'child',
+      seedLength: 11,
+      parentTraceId: child.traceId,
+      linked: true,
+    })
+    expect(grandchild?.parentTraceId).not.toBe(parent.traceId)
+  })
 })

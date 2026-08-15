@@ -68,5 +68,19 @@ export const ATTR_DSH_TURN_END_REASON = 'dsh.turn.end_reason'
 export const ATTR_DSH_TRACE_DETERMINISTIC_ID = 'dsh.trace.deterministic_id'
 /** Marks the root of the DSH-owned subtree, even when it has an external parent. */
 export const ATTR_DSH_TRACE_LOGICAL_ROOT = 'dsh.trace.logical_root'
+/** Direct DSH session from which this child borrowed its seed. */
+export const ATTR_DSH_SESSION_PARENT_ID = 'dsh.session.parent_id'
+/** Number of leading canonical events inherited from the direct parent. */
+export const ATTR_DSH_SESSION_SEED_LENGTH = 'dsh.session.seed_length'
+/** Trace ID of the resolved completed parent turn at the fork boundary. */
+export const ATTR_DSH_LINEAGE_PARENT_TRACE_ID = 'dsh.lineage.parent_trace_id'
+/** Whether the child root contains a real OTel Link to the parent turn. */
+export const ATTR_DSH_LINEAGE_LINKED = 'dsh.lineage.linked'
+/** Causal relationship type carried on an OTel Link. */
+export const ATTR_DSH_LINK_TYPE = 'dsh.link.type'
+/** Langfuse trace metadata mirrors for lineage filtering. */
+export const ATTR_LANGFUSE_TRACE_METADATA_DSH_PARENT_SESSION_ID = 'langfuse.trace.metadata.dsh_parent_session_id'
+export const ATTR_LANGFUSE_TRACE_METADATA_DSH_SEED_LENGTH = 'langfuse.trace.metadata.dsh_seed_length'
+export const ATTR_LANGFUSE_TRACE_METADATA_DSH_PARENT_TRACE_ID = 'langfuse.trace.metadata.dsh_parent_trace_id'
 /** Marks a span closed by teardown or crash sweep rather than its own end event. */
 export const ATTR_DSH_FORCE_ENDED = 'dsh.force_ended'

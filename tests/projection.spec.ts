@@ -399,5 +399,69 @@ describe('SessionSpanFolder', () => {
     }))
   })
 
-  it.todo('[v0.2] fork/resume lineage: seeds never re-fold; stitch via session.parent_id trace links')
+  it('stitches every child turn to the completed parent boundary and preserves lineage on resume', () => {
+    const parentId = 'parent-session'
+    const childId = 'child-session'
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }, 'info', { 'session.id': parentId }))
+    folder.fold(ledger('turn/end', 5, 1_100, { turn: 1, reason: { kind: 'completed' } }, 'info', { 'session.id': parentId }))
+
+    const childLineage = {
+      'session.id': childId,
+      'session.parent_id': parentId,
+      'session.seed_length': 6,
+    }
+    folder.fold(ledger('turn/start', 7, 2_000, { turn: 2 }, 'info', childLineage))
+    folder.fold(ledger('turn/end', 8, 2_100, { turn: 2, reason: { kind: 'completed' } }, 'info', childLineage))
+    // Simulate a later/resumed turn whose waterfall no longer repeats header
+    // attributes: the registry retains the session's first lineage snapshot.
+    folder.fold(ledger('turn/start', 9, 3_000, { turn: 3 }, 'info', { 'session.id': childId }))
+    folder.fold(ledger('turn/end', 10, 3_100, { turn: 3, reason: { kind: 'completed' } }, 'info', { 'session.id': childId }))
+
+    const spans = exporter.getFinishedSpans()
+    const parent = spans.find(span => span.attributes['dsh.session.id'] === parentId)!
+    const childTurns = spans.filter(span => span.attributes['dsh.session.id'] === childId)
+    expect(childTurns).toHaveLength(2)
+    for (const child of childTurns) {
+      expect(child.attributes).toMatchObject({
+        'dsh.session.parent_id': parentId,
+        'dsh.session.seed_length': 6,
+        'dsh.lineage.parent_trace_id': parent.spanContext().traceId,
+        'dsh.lineage.linked': true,
+        'langfuse.trace.metadata.dsh_parent_session_id': parentId,
+        'langfuse.trace.metadata.dsh_seed_length': 6,
+        'langfuse.trace.metadata.dsh_parent_trace_id': parent.spanContext().traceId,
+      })
+      expect(child.links).toHaveLength(1)
+      expect(child.links[0]).toMatchObject({
+        context: parent.spanContext(),
+        attributes: {
+          'dsh.link.type': 'fork',
+          'dsh.session.parent_id': parentId,
+          'dsh.session.seed_length': 6,
+        },
+      })
+    }
+  })
+
+  it('keeps child metadata without fabricating a Link when parent context is unavailable', () => {
+    folder.fold(ledger('turn/start', 7, 2_000, { turn: 2 }, 'info', {
+      'session.id': 'orphan-child',
+      'session.parent_id': 'missing-parent',
+      'session.seed_length': 6,
+    }))
+    folder.fold(ledger('turn/end', 8, 2_100, { turn: 2, reason: { kind: 'completed' } }, 'info', {
+      'session.id': 'orphan-child',
+    }))
+
+    const child = exporter.getFinishedSpans().find(span => span.attributes['dsh.session.id'] === 'orphan-child')!
+    expect(child.attributes).toMatchObject({
+      'dsh.session.parent_id': 'missing-parent',
+      'dsh.session.seed_length': 6,
+      'dsh.lineage.linked': false,
+      'langfuse.trace.metadata.dsh_parent_session_id': 'missing-parent',
+      'langfuse.trace.metadata.dsh_seed_length': 6,
+    })
+    expect(child.attributes['dsh.lineage.parent_trace_id']).toBeUndefined()
+    expect(child.links).toEqual([])
+  })
 })

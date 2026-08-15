@@ -40,6 +40,7 @@ interface V2Observation {
   sessionId?: string
   userId?: string
   isRootObservation?: boolean
+  metadata?: Record<string, unknown>
   input?: unknown
   output?: unknown
 }
@@ -65,6 +66,8 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
   it('ingests the exported session and serves the trace tree back through the public API', { timeout: 300_000 }, async () => {
     const fromStartTime = new Date(Date.now() - 5_000).toISOString()
     let sessionIds: string[] = []
+    let parentSessionId = ''
+    let childSessionId = ''
     let feedbackText = ''
     await runLoaderSmoke({
       label: 'dsh-plugin-langfuse-cloud',
@@ -77,9 +80,13 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
       inspect: async (cwd) => {
         const output = JSON.parse(await readFile(join(cwd, 'cloud-session.json'), 'utf8')) as {
           sessionIds: string[]
+          parentSessionId: string
+          childSessionId: string
           feedbackText: string
         }
         sessionIds = output.sessionIds
+        parentSessionId = output.parentSessionId
+        childSessionId = output.childSessionId
         feedbackText = output.feedbackText
       },
     })
@@ -91,7 +98,7 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     let rows: V2Observation[] = []
     for (;;) {
       const params = new URLSearchParams({
-        fields: 'core,basic,io,model,usage',
+        fields: 'core,basic,io,metadata,model,usage',
         userId: 'dsh-plugin-langfuse-e2e',
         fromStartTime,
         toStartTime: new Date(Date.now() + 1_000).toISOString(),
@@ -100,12 +107,15 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
       const page = await api<{ data?: V2Observation[] }>(`/api/public/v2/observations?${params}`)
       rows = (page.data ?? []).filter(row => row.sessionId !== undefined && sessionIds.includes(row.sessionId))
       const generations = rows.filter(row => row.type === 'GENERATION')
-      const root = rows.find(row => row.isRootObservation === true)
+      const root = rows.find(row => row.isRootObservation === true && row.sessionId === parentSessionId)
+      const childRoot = rows.find(row => row.isRootObservation === true && row.sessionId === childSessionId)
       const ready = generations.length >= 2
         && generations.every(row => row.model === 'langfuse-mock' && row.usageDetails !== undefined)
         && rows.some(row => row.type === 'TOOL' && row.name === 'bash')
         && root?.input != null
         && root.output != null
+        && childRoot?.metadata?.dsh_parent_session_id === parentSessionId
+        && childRoot.metadata.dsh_parent_trace_id === root.traceId
       if (ready || Date.now() >= deadline) break
       await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
     }
@@ -149,7 +159,7 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     // v4 queries filter per observation, so identity must ride every span:
     // each generation/tool row of the observation-first API serves its own
     // session/user fields — the root-span stamp alone is not the contract.
-    const root = rows.find(row => row.isRootObservation === true)
+    const root = rows.find(row => row.isRootObservation === true && row.sessionId === parentSessionId)
     expect(root, 'v4 root observation').toBeDefined()
     expect(root!.input, 'v4 root observation input').toBeDefined()
     expect(root!.output, 'v4 root observation output').toBeDefined()
@@ -160,6 +170,16 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
       expect(row.userId, `observation ${row.name ?? '?'} userId`).toBe('dsh-plugin-langfuse-e2e')
     }
 
+    // Langfuse may not render OTel Links as a clickable UI edge, so the Cloud
+    // contract is the queryable metadata mirror on every child trace root.
+    const childRoot = rows.find(row => row.isRootObservation === true && row.sessionId === childSessionId)
+    expect(childRoot, 'child root observation').toBeDefined()
+    expect(childRoot?.metadata).toMatchObject({
+      dsh_parent_session_id: parentSessionId,
+      dsh_parent_trace_id: root?.traceId,
+    })
+    expect(childRoot?.metadata?.dsh_seed_length).toEqual(expect.any(Number))
+
     // The current read API returns one typed `value` and a discriminated
     // session subject. Poll it separately because trace and Score ingestion
     // are deliberately independent asynchronous channels.
@@ -169,7 +189,7 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
       const params = new URLSearchParams({
         fields: 'details,subject',
         name: 'dsh_user_feedback',
-        sessionId: sessionIds.join(','),
+        sessionId: parentSessionId,
         fromTimestamp: fromStartTime,
         limit: '100',
       })

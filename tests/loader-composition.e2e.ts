@@ -25,6 +25,11 @@ interface OtlpSpan {
   spanId: string
   traceId: string
   attributes?: { key: string; value: Record<string, unknown> }[]
+  links?: {
+    traceId: string
+    spanId: string
+    attributes?: { key: string; value: Record<string, unknown> }[]
+  }[]
   status?: { code?: number }
 }
 
@@ -89,6 +94,7 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         expect(names).toContain('turn 1')
         expect(names).toContain('step 1')
         expect(names).toContain('tool bash')
+        expect(spans.filter(span => span.name === 'turn 1')).toHaveLength(1)
 
         const turn = spans.find(span => span.name === 'turn 1')!
         expect(attr(turn, 'langfuse.observation.input')).toBeDefined()
@@ -103,6 +109,22 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         expect(attr(turn, 'dsh.trace.deterministic_id')).toEqual({ stringValue: turn.traceId })
         expect(attr(turn, 'dsh.trace.logical_root')).toEqual({ boolValue: true })
         expect(attr(turn, 'langfuse.internal.is_app_root')).toEqual({ boolValue: true })
+
+        // The fixture forks a real child session after the parent turn. Its
+        // new turn is a separate trace linked to the completed parent root.
+        const child = spans.find(span => span.name === 'turn 2')!
+        const childSessionId = (attr(child, 'dsh.session.id') as { stringValue: string }).stringValue
+        expect(child.traceId).toBe(createDshTurnTraceId(childSessionId, 2))
+        expect(attr(child, 'dsh.session.parent_id')).toEqual({ stringValue: dshSessionId })
+        expect(attr(child, 'dsh.session.seed_length')).toEqual(expect.objectContaining({ intValue: expect.any(Number) }))
+        expect(attr(child, 'dsh.lineage.parent_trace_id')).toEqual({ stringValue: turn.traceId })
+        expect(attr(child, 'dsh.lineage.linked')).toEqual({ boolValue: true })
+        expect(attr(child, 'langfuse.trace.metadata.dsh_parent_session_id')).toEqual({ stringValue: dshSessionId })
+        expect(attr(child, 'langfuse.trace.metadata.dsh_parent_trace_id')).toEqual({ stringValue: turn.traceId })
+        expect(child.links).toHaveLength(1)
+        expect(child.links?.[0]).toMatchObject({ traceId: turn.traceId, spanId: turn.spanId })
+        const linkType = child.links?.[0]?.attributes?.find(entry => entry.key === 'dsh.link.type')?.value
+        expect(linkType).toEqual({ stringValue: 'fork' })
 
         const generation = spans.find(span => span.name === 'step 1')!
         expect(generation.parentSpanId).toBe(turn.spanId)
