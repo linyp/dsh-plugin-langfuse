@@ -37,9 +37,13 @@ export const ATTR_GEN_AI_REQUEST_MODEL = 'gen_ai.request.model'
 export const ATTR_GEN_AI_PROVIDER_NAME = 'gen_ai.provider.name'
 export const ATTR_GEN_AI_USAGE_INPUT_TOKENS = 'gen_ai.usage.input_tokens'
 export const ATTR_GEN_AI_USAGE_OUTPUT_TOKENS = 'gen_ai.usage.output_tokens'
-/** Non-standard usage detail buckets; Langfuse ingests them as usage details. */
-export const ATTR_GEN_AI_USAGE_CACHE_READ_TOKENS = 'gen_ai.usage.cache_read_tokens'
-export const ATTR_GEN_AI_USAGE_REASONING_TOKENS = 'gen_ai.usage.reasoning_tokens'
+export const ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS = 'gen_ai.usage.cache_read.input_tokens'
+export const ATTR_GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS = 'gen_ai.usage.cache_creation.input_tokens'
+export const ATTR_GEN_AI_USAGE_REASONING_OUTPUT_TOKENS = 'gen_ai.usage.reasoning.output_tokens'
+/** @deprecated Use `ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS`. */
+export const ATTR_GEN_AI_USAGE_CACHE_READ_TOKENS = ATTR_GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS
+/** @deprecated Use `ATTR_GEN_AI_USAGE_REASONING_OUTPUT_TOKENS`. */
+export const ATTR_GEN_AI_USAGE_REASONING_TOKENS = ATTR_GEN_AI_USAGE_REASONING_OUTPUT_TOKENS
 export const ATTR_GEN_AI_TOOL_NAME = 'gen_ai.tool.name'
 export const ATTR_GEN_AI_TOOL_CALL_ID = 'gen_ai.tool.call.id'
 

@@ -46,10 +46,6 @@ import {
   ATTR_GEN_AI_REQUEST_MODEL,
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_NAME,
-  ATTR_GEN_AI_USAGE_CACHE_READ_TOKENS,
-  ATTR_GEN_AI_USAGE_INPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_OUTPUT_TOKENS,
-  ATTR_GEN_AI_USAGE_REASONING_TOKENS,
   ATTR_LANGFUSE_COMPLETION_START_TIME,
   ATTR_LANGFUSE_OBSERVATION_INPUT,
   ATTR_LANGFUSE_OBSERVATION_OUTPUT,
@@ -60,6 +56,7 @@ import {
   ATTR_LANGFUSE_TRACE_OUTPUT,
   ATTR_LANGFUSE_USER_ID,
 } from './semconv.ts'
+import { toGenAiUsageAttributes } from './usage.ts'
 
 /**
  * Default serialized-payload ceiling per span attribute. Guards the export
@@ -288,14 +285,7 @@ export class SessionSpanFolder {
           [ATTR_LANGFUSE_TRACE_OUTPUT]: output,
         })
         if (usage !== undefined) {
-          stepState.span.setAttribute(ATTR_GEN_AI_USAGE_INPUT_TOKENS, usage.inputTokens)
-          stepState.span.setAttribute(ATTR_GEN_AI_USAGE_OUTPUT_TOKENS, usage.outputTokens)
-          if (usage.cacheReadTokens !== undefined) {
-            stepState.span.setAttribute(ATTR_GEN_AI_USAGE_CACHE_READ_TOKENS, usage.cacheReadTokens)
-          }
-          if (usage.reasoningTokens !== undefined) {
-            stepState.span.setAttribute(ATTR_GEN_AI_USAGE_REASONING_TOKENS, usage.reasoningTokens)
-          }
+          stepState.span.setAttributes(toGenAiUsageAttributes(usage))
         }
         return
       }

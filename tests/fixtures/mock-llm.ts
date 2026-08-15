@@ -39,7 +39,7 @@ class LangfuseMockAdapter extends LlmAdapter {
       yield { type: 'block-start', index: 0, blockType: 'tool-call' }
       yield { type: 'tool-call-delta', index: 0, id: CallId('langfuse-e2e-call'), name: 'bash', argumentsDelta: args }
       yield { type: 'block-end', index: 0, block: { type: 'tool-call', id: CallId('langfuse-e2e-call'), name: 'bash', arguments: args } }
-      yield { type: 'usage', usage: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 } }
+      yield { type: 'usage', usage: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2, cacheWriteTokens: 3 } }
       yield { type: 'finish', reason: { kind: 'tool-calls' } }
       return
     }

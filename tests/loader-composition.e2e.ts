@@ -83,7 +83,17 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         const generation = spans.find(span => span.name === 'step 1')!
         expect(generation.parentSpanId).toBe(turn.spanId)
         expect(attr(generation, 'langfuse.observation.type')).toEqual({ stringValue: 'generation' })
-        expect(attr(generation, 'gen_ai.usage.input_tokens')).toEqual({ intValue: 11 })
+        // DSH buckets are disjoint; canonical OTel input is inclusive.
+        expect(attr(generation, 'gen_ai.usage.input_tokens')).toEqual({ intValue: 16 })
+        expect(attr(generation, 'gen_ai.usage.output_tokens')).toEqual({ intValue: 3 })
+        expect(attr(generation, 'gen_ai.usage.cache_read.input_tokens')).toEqual({ intValue: 2 })
+        expect(attr(generation, 'gen_ai.usage.cache_creation.input_tokens')).toEqual({ intValue: 3 })
+        expect(attr(generation, 'gen_ai.usage.cache_read_tokens')).toBeUndefined()
+
+        const secondGeneration = spans.find(span => span.name === 'step 2')!
+        expect(attr(secondGeneration, 'gen_ai.usage.output_tokens')).toEqual({ intValue: 5 })
+        expect(attr(secondGeneration, 'gen_ai.usage.reasoning.output_tokens')).toEqual({ intValue: 1 })
+        expect(attr(secondGeneration, 'gen_ai.usage.reasoning_tokens')).toBeUndefined()
 
         // The tool span nests under the generation whose model request called it.
         const tool = spans.find(span => span.name === 'tool bash')!

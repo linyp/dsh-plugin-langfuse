@@ -24,29 +24,19 @@ const configPath = fileURLToPath(new URL('./fixtures/langfuse-cloud.cordis.yml',
 const INGESTION_DEADLINE_MS = 120_000
 const POLL_INTERVAL_MS = 5_000
 
-interface TraceSummary {
+/** Row shape returned by Langfuse's v4 `/api/public/v2/observations` list. */
+interface V2Observation {
   id: string
-  name?: string
-  sessionId?: string
-}
-
-interface Observation {
+  traceId: string
   type?: string
   name?: string
   model?: string
-  usage?: { input?: number; output?: number }
+  usageDetails?: Record<string, number>
+  inputUsage?: number
+  outputUsage?: number
+  totalUsage?: number
+  totalCost?: number | null
   parentObservationId?: string | null
-  id?: string
-}
-
-interface TraceDetail extends TraceSummary {
-  observations?: Observation[]
-}
-
-/** Row shape of the v4-era `/api/public/v2/observations` list. */
-interface V2Observation {
-  type?: string
-  name?: string
   sessionId?: string
   userId?: string
   isRootObservation?: boolean
@@ -64,6 +54,7 @@ async function api<T>(path: string): Promise<T> {
 
 describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse cloud round trip', () => {
   it('ingests the exported session and serves the trace tree back through the public API', { timeout: 300_000 }, async () => {
+    const fromStartTime = new Date(Date.now() - 5_000).toISOString()
     let sessionIds: string[] = []
     await runLoaderSmoke({
       label: 'dsh-plugin-langfuse-cloud',
@@ -80,70 +71,78 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     })
     expect(sessionIds.length).toBeGreaterThan(0)
 
-    // Poll until Langfuse's asynchronous ingestion surfaces the COMPLETE
-    // trace: the trace summary, its observation rows, and their fields
-    // (model, usage) all materialize incrementally, so a readiness predicate
-    // gates the assertions instead of the first partial snapshot.
+    // Poll the v4 observation-first API only. The bounded window plus known
+    // user id locates fresh rows; their session id narrows them to this run.
     const deadline = Date.now() + INGESTION_DEADLINE_MS
-    let detail: TraceDetail | undefined
+    let rows: V2Observation[] = []
     for (;;) {
-      const pages = await Promise.all(sessionIds.map(id =>
-        api<{ data?: TraceSummary[] }>(`/api/public/traces?sessionId=${encodeURIComponent(id)}`)))
-      for (const trace of pages.flatMap(page => page.data ?? [])) {
-        const candidate = await api<TraceDetail>(`/api/public/traces/${trace.id}`)
-        const generations = (candidate.observations ?? []).filter(o => o.type === 'GENERATION')
-        const ready = generations.length > 0 && generations.every(o => o.model != null)
-          && (candidate.observations ?? []).some(o => o.name === 'bash')
-        if (ready) detail = candidate
-      }
-      if (detail !== undefined || Date.now() >= deadline) break
+      const params = new URLSearchParams({
+        fields: 'core,basic,io,model,usage',
+        userId: 'dsh-plugin-langfuse-e2e',
+        fromStartTime,
+        toStartTime: new Date(Date.now() + 1_000).toISOString(),
+        limit: '1000',
+      })
+      const page = await api<{ data?: V2Observation[] }>(`/api/public/v2/observations?${params}`)
+      rows = (page.data ?? []).filter(row => row.sessionId !== undefined && sessionIds.includes(row.sessionId))
+      const generations = rows.filter(row => row.type === 'GENERATION')
+      const root = rows.find(row => row.isRootObservation === true)
+      const ready = generations.length >= 2
+        && generations.every(row => row.model === 'langfuse-mock' && row.usageDetails !== undefined)
+        && rows.some(row => row.type === 'TOOL' && row.name === 'bash')
+        && root?.input != null
+        && root.output != null
+      if (ready || Date.now() >= deadline) break
       await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
     }
-    expect(detail, `no complete trace ingested for sessions ${sessionIds.join(', ')} within ${INGESTION_DEADLINE_MS}ms`).toBeDefined()
-    const observations = detail!.observations ?? []
+    expect(rows.length, `no complete trace ingested for sessions ${sessionIds.join(', ')} within ${INGESTION_DEADLINE_MS}ms`).toBeGreaterThan(0)
 
-    // Every generation carries the model identity; the first step carries
-    // the mock adapter's fixed usage.
-    const generations = observations.filter(observation => observation.type === 'GENERATION')
-    expect(generations.length).toBeGreaterThan(0)
+    // Langfuse normalizes canonical inclusive OTel usage back into mutually
+    // exclusive buckets: 16 total input = 11 uncached + 2 read + 3 created.
+    const generations = rows.filter(row => row.type === 'GENERATION')
     for (const generation of generations) expect(generation.model).toBe('langfuse-mock')
-    const step1 = observations.find(observation => observation.name === 'step 1')
-    expect(step1?.usage?.input).toBe(11)
-    expect(step1?.usage?.output).toBe(3)
+    const step1 = generations.find(row => row.name === 'step 1')
+    expect(step1?.usageDetails).toMatchObject({
+      input: 11,
+      output: 3,
+      input_cached_tokens: 2,
+      input_cache_creation: 3,
+    })
+    expect(step1?.inputUsage).toBe(16)
+    expect(step1?.outputUsage).toBe(3)
+    expect(step1?.totalUsage).toBe(19)
+
+    const step2 = generations.find(row => row.name === 'step 2')
+    expect(step2?.usageDetails).toMatchObject({
+      input: 7,
+      output: 4,
+      output_reasoning_tokens: 1,
+      total: 12,
+    })
+    expect(step2?.inputUsage).toBe(7)
+    expect(step2?.outputUsage).toBe(5)
+    expect(step2?.totalUsage).toBe(12)
 
     // The tool observation nests under its requesting generation. Langfuse
     // names tool observations from `gen_ai.tool.name` (`bash`), not the span
     // name (`tool bash`).
-    const tool = observations.find(observation => observation.name === 'bash')
-    expect(tool, `no tool observation among: ${JSON.stringify(observations.map(o => o.name))}`).toBeDefined()
-    const requestingStep = observations.find(observation => observation.name === 'step 1')
+    const tool = rows.find(row => row.type === 'TOOL' && row.name === 'bash')
+    expect(tool, `no tool observation among: ${JSON.stringify(rows.map(o => o.name))}`).toBeDefined()
+    const requestingStep = rows.find(row => row.traceId === tool!.traceId && row.name === 'step 1')
     expect(requestingStep).toBeDefined()
     expect(tool!.parentObservationId).toBe(requestingStep!.id)
 
     // v4 queries filter per observation, so identity must ride every span:
     // each generation/tool row of the observation-first API serves its own
     // session/user fields — the root-span stamp alone is not the contract.
-    let rows: V2Observation[] = []
-    let root: V2Observation | undefined
-    const v2Deadline = Date.now() + INGESTION_DEADLINE_MS
-    for (;;) {
-      const page = await api<{ data?: V2Observation[] }>(`/api/public/v2/observations?traceId=${detail!.id}&fields=core,basic,io&limit=100`)
-      const observationsV2 = page.data ?? []
-      rows = observationsV2.filter(row => row.type === 'GENERATION' || row.type === 'TOOL')
-      root = observationsV2.find(row => row.isRootObservation === true)
-      const ready = rows.length > 0
-        && rows.every(row => row.userId != null && row.userId.length > 0)
-        && root?.input != null
-        && root.output != null
-      if (ready || Date.now() >= v2Deadline) break
-      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
-    }
+    const root = rows.find(row => row.isRootObservation === true)
     expect(root, 'v4 root observation').toBeDefined()
     expect(root!.input, 'v4 root observation input').toBeDefined()
     expect(root!.output, 'v4 root observation output').toBeDefined()
-    expect(rows.length).toBeGreaterThan(0)
-    for (const row of rows) {
-      expect(row.sessionId, `observation ${row.name ?? '?'} sessionId`).toBe(detail!.sessionId)
+    const children = rows.filter(row => row.type === 'GENERATION' || row.type === 'TOOL')
+    expect(children.length).toBeGreaterThan(0)
+    for (const row of children) {
+      expect(sessionIds).toContain(row.sessionId)
       expect(row.userId, `observation ${row.name ?? '?'} userId`).toBe('dsh-plugin-langfuse-e2e')
     }
   })

@@ -80,12 +80,14 @@ config:
 |---|---|
 | session（`session.id`） | session（每个导出的 observation/span 都带 `langfuse.session.id`） |
 | `turn/start` / `turn/end` | trace 根 observation（root span；错误结束原因置 span 状态为 ERROR） |
-| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** —— 模型、provider、输出、`gen_ai.usage.*` token（input/output/cache-read/reasoning）；最新一条 assistant message 同时成为根 observation 的整体输出 |
+| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** —— 模型、provider、输出、规范的 `gen_ai.usage.*` token（input/output/cache-read/cache-creation/reasoning）；最新一条 assistant message 同时成为根 observation 的整体输出 |
 | step 的首个 `assistant/chunk` | `langfuse.observation.completion_start_time`（首 token 时间） |
 | `tool/call` + `tool/result` | tool span（参数为 input，结果为 output，`isError` → 状态 ERROR） |
 | `user/message` | 根 observation input；同时保留已弃用的 trace input，以兼容旧版 evaluator |
-| `agent-error` ops 记录 | 开放 turn 上的 exception 事件 + 状态 ERROR |
+| `agent-error` ops 记录 | 开放 turn 上的 `agent-error` span event + 状态 ERROR |
 | 其他所有事件类型（todo、plan、compaction、hooks、插件事件） | 开放 turn 上的时间点 span event |
+
+Token 计量遵循 OpenTelemetry GenAI 的 inclusive-total 契约。DSH 报告的是互斥输入 buckets（`inputTokens` 仅包含未缓存输入），因此导出的 `gen_ai.usage.input_tokens` 会重建为 `inputTokens + cacheReadTokens + cacheWriteTokens`；cache read/write 与 reasoning 继续作为规范的明细属性。Langfuse 随后只需执行一次归一化，即可得到互斥 usage buckets。
 
 ## 架构决策
 

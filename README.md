@@ -80,12 +80,14 @@ config:
 |---|---|
 | session (`session.id`) | session (`langfuse.session.id` on every exported observation/span) |
 | `turn/start` / `turn/end` | trace root observation (root span; error end reasons set span status ERROR) |
-| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** — model, provider, output, `gen_ai.usage.*` tokens (input/output/cache-read/reasoning); the latest assistant message also becomes the root observation's overall output |
+| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** — model, provider, output, canonical `gen_ai.usage.*` tokens (input/output/cache-read/cache-creation/reasoning); the latest assistant message also becomes the root observation's overall output |
 | first `assistant/chunk` of a step | `langfuse.observation.completion_start_time` (time-to-first-token) |
 | `tool/call` + `tool/result` | tool span (arguments as input, result as output, `isError` → status ERROR) |
 | `user/message` | root observation input; deprecated trace input is retained for legacy evaluator compatibility |
-| `agent-error` ops record | exception event + status ERROR on the open turn |
+| `agent-error` ops record | `agent-error` span event + status ERROR on the open turn |
 | every other event type (todo, plan, compaction, hooks, plugin events) | point-in-time span event on the open turn |
+
+Token accounting follows the OpenTelemetry GenAI inclusive-total contract. DSH reports mutually exclusive input buckets (`inputTokens` is uncached input), so the exported `gen_ai.usage.input_tokens` is reconstructed as `inputTokens + cacheReadTokens + cacheWriteTokens`; cache read/write and reasoning remain canonical detail attributes. Langfuse can then normalize them into mutually exclusive usage buckets exactly once.
 
 ## Architecture decisions
 

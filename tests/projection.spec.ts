@@ -62,7 +62,7 @@ describe('SessionSpanFolder', () => {
       turn: 1,
       step: 0,
       message: { role: 'assistant', content: [{ type: 'text', text: 'done' }] },
-      usage: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2 },
+      usage: { inputTokens: 11, outputTokens: 3, cacheReadTokens: 2, cacheWriteTokens: 3 },
     }))
     folder.fold(ledger('tool/call', 7, 2_010, { turn: 1, step: 0, callId: 'call-1', name: 'bash', arguments: '{"command":"true"}' }))
     folder.fold(ledger('step/end', 8, 2_020, { turn: 1, step: 0 }))
@@ -98,9 +98,10 @@ describe('SessionSpanFolder', () => {
     expect(step.attributes['langfuse.session.id']).toBe(SESSION_ID)
     expect(step.attributes['gen_ai.request.model']).toBe('deepseek-chat')
     expect(step.attributes['gen_ai.provider.name']).toBe('deepseek')
-    expect(step.attributes['gen_ai.usage.input_tokens']).toBe(11)
+    expect(step.attributes['gen_ai.usage.input_tokens']).toBe(16)
     expect(step.attributes['gen_ai.usage.output_tokens']).toBe(3)
-    expect(step.attributes['gen_ai.usage.cache_read_tokens']).toBe(2)
+    expect(step.attributes['gen_ai.usage.cache_read.input_tokens']).toBe(2)
+    expect(step.attributes['gen_ai.usage.cache_creation.input_tokens']).toBe(3)
     expect(step.attributes['langfuse.observation.completion_start_time']).toBe(new Date(1_500).toISOString())
     expect(step.attributes['langfuse.observation.output']).toContain('done')
     expect(millis(step.startTime)).toBe(1_030)
@@ -322,7 +323,28 @@ describe('SessionSpanFolder', () => {
     }
   })
 
-  it.todo('FEEDBACK_ONLY replay: a historical prefix rebuilds the identical tree (same mechanism, add a scripted replay fixture)')
-  it.todo('fork/resume lineage: seeds never re-fold; stitch via session.parent_id trace links')
-  it.todo('agent-error ops record marks the open turn span with an exception event')
+  it('marks the open turn when an agent-error ops record arrives', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold({
+      channel: 'ops',
+      time: 1_010,
+      severity: 'error',
+      attributes: {
+        'telemetry.op': 'agent-error',
+        'session.id': SESSION_ID,
+        'error.name': 'TypeError',
+      },
+      body: { name: 'TypeError', message: 'adapter exploded' },
+    })
+    folder.fold(ledger('turn/end', 2, 1_020, { turn: 1, reason: { kind: 'error' } }, 'error'))
+
+    const turn = spansByName().get('turn 1')!
+    expect(turn.status.code).toBe(SpanStatusCode.ERROR)
+    expect(turn.events).toContainEqual(expect.objectContaining({
+      name: 'agent-error',
+      attributes: { 'error.name': 'TypeError' },
+    }))
+  })
+
+  it.todo('[v0.2] fork/resume lineage: seeds never re-fold; stitch via session.parent_id trace links')
 })
