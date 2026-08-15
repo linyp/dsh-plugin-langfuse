@@ -29,6 +29,9 @@
     auth:
       publicKey: !!js process.env.LANGFUSE_PUBLIC_KEY
       secretKey: !!js process.env.LANGFUSE_SECRET_KEY
+    feedbackScores:
+      enabled: true
+      url: !!js (process.env.LANGFUSE_HOST ?? 'https://cloud.langfuse.com') + '/api/public/scores'
     correlation:
       # sessionId is left to its dsh-session-id default so the readback can
       # keep querying traces by the driver-reported session ids.

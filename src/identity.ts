@@ -20,6 +20,7 @@ import {
 } from '@opentelemetry/api'
 
 const TURN_TRACE_ID_NAMESPACE = 'dsh-plugin-langfuse:turn-trace:v1'
+const FEEDBACK_SCORE_ID_NAMESPACE = 'dsh-plugin-langfuse:feedback-score:v1'
 const INVALID_TRACE_ID = '00000000000000000000000000000000'
 
 /**
@@ -75,6 +76,28 @@ export function createDshTurnTraceId(dshSessionId: string, turn: number): string
   // SHA-256 producing 128 zero prefix bits is astronomically unlikely, but
   // W3C forbids the all-zero Trace ID, so preserve validity defensively.
   return traceId === INVALID_TRACE_ID ? `${traceId.slice(0, -1)}1` : traceId
+}
+
+/**
+ * Derive the stable client-supplied Langfuse Score ID for one canonical
+ * feedback event. The namespace and encoding are a durable 0.2.x wire
+ * contract, just like {@link createDshTurnTraceId}.
+ */
+export function createDshFeedbackScoreId(dshSessionId: string, eventSeq: number): string {
+  if (typeof dshSessionId !== 'string' || dshSessionId.length === 0) {
+    throw new Error('dsh-plugin-langfuse: dshSessionId must be non-empty')
+  }
+  if (!Number.isSafeInteger(eventSeq) || eventSeq < 0) {
+    throw new Error(`dsh-plugin-langfuse: eventSeq must be a non-negative safe integer, got ${String(eventSeq)}`)
+  }
+  return createHash('sha256')
+    .update(FEEDBACK_SCORE_ID_NAMESPACE)
+    .update('\0')
+    .update(dshSessionId)
+    .update('\0')
+    .update(String(eventSeq))
+    .digest('hex')
+    .slice(0, 32)
 }
 
 /**

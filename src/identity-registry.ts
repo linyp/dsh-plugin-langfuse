@@ -39,7 +39,15 @@ export interface TurnIdentity extends TurnParentContext {
 
 interface SessionIdentity {
   latestLangfuseSessionId: string
+  ambiguousLangfuseSession: boolean
   turns: Map<number, TurnIdentity>
+}
+
+/** Session-level subject state consumed by the feedback Score mapper. */
+export interface ScoreSessionIdentity {
+  langfuseSessionId: string | undefined
+  /** More than one per-turn Langfuse session id was observed. */
+  ambiguous: boolean
 }
 
 export interface TelemetryIdentityRegistryOptions {
@@ -75,7 +83,11 @@ export class TelemetryIdentityRegistry {
   beginTurn(input: BeginTurnIdentity): TurnIdentity {
     let session = this.sessions.get(input.dshSessionId)
     if (session === undefined) {
-      session = { latestLangfuseSessionId: input.langfuseSessionId, turns: new Map() }
+      session = {
+        latestLangfuseSessionId: input.langfuseSessionId,
+        ambiguousLangfuseSession: false,
+        turns: new Map(),
+      }
       this.sessions.set(input.dshSessionId, session)
       this.evictSessionsIfNeeded()
     } else {
@@ -88,7 +100,10 @@ export class TelemetryIdentityRegistry {
     if (existing !== undefined) {
       session.turns.delete(input.turn)
       session.turns.set(input.turn, existing)
-      session.latestLangfuseSessionId = existing.langfuseSessionId
+      if (session.latestLangfuseSessionId !== existing.langfuseSessionId) {
+        session.ambiguousLangfuseSession = true
+        session.latestLangfuseSessionId = existing.langfuseSessionId
+      }
       return existing
     }
 
@@ -101,7 +116,10 @@ export class TelemetryIdentityRegistry {
       startSeq: input.startSeq,
       langfuseSessionId: input.langfuseSessionId,
     }
-    session.latestLangfuseSessionId = input.langfuseSessionId
+    if (session.latestLangfuseSessionId !== input.langfuseSessionId) {
+      session.ambiguousLangfuseSession = true
+      session.latestLangfuseSessionId = input.langfuseSessionId
+    }
     session.turns.set(input.turn, identity)
     this.evictTurnsIfNeeded(session)
     return identity
@@ -130,6 +148,15 @@ export class TelemetryIdentityRegistry {
   /** Future Score mapping uses the most recently resolved per-turn subject. */
   getLatestLangfuseSessionId(dshSessionId: string): string | undefined {
     return this.sessions.get(dshSessionId)?.latestLangfuseSessionId
+  }
+
+  /** Resolve Score subject state without exposing or mutating the registry. */
+  resolveScoreSession(dshSessionId: string): ScoreSessionIdentity {
+    const session = this.sessions.get(dshSessionId)
+    return {
+      langfuseSessionId: session?.latestLangfuseSessionId,
+      ambiguous: session?.ambiguousLangfuseSession ?? false,
+    }
   }
 
   /** Test/diagnostic visibility without exposing the backing maps. */

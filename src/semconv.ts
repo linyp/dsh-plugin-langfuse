@@ -26,6 +26,14 @@ export const ATTR_LANGFUSE_TRACE_INPUT = 'langfuse.trace.input'
 export const ATTR_LANGFUSE_TRACE_OUTPUT = 'langfuse.trace.output'
 /** Trace display name in Langfuse's trace list. */
 export const ATTR_LANGFUSE_TRACE_NAME = 'langfuse.trace.name'
+/**
+ * Marks the DSH turn as the application root observation. This is distinct
+ * from being a physical OTel root: deterministic Trace IDs require a
+ * non-recording synthetic parent, and distributed traces may have a real
+ * upstream parent. Langfuse uses this marker to expose the turn through
+ * `isRootObservation` in its observation-first API.
+ */
+export const ATTR_LANGFUSE_INTERNAL_IS_APP_ROOT = 'langfuse.internal.is_app_root'
 /** Stable DSH logical Trace ID, queryable when an external W3C Trace ID wins. */
 export const ATTR_LANGFUSE_TRACE_METADATA_DSH_DETERMINISTIC_TRACE_ID = 'langfuse.trace.metadata.dsh_deterministic_trace_id'
 /** ISO-8601 first-token time; Langfuse derives time-to-first-token from it. */

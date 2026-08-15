@@ -44,6 +44,15 @@ interface V2Observation {
   output?: unknown
 }
 
+interface V3Score {
+  id: string
+  name: string
+  value: string | number | boolean
+  dataType: string
+  metadata?: Record<string, unknown>
+  subject?: { kind: string; id: string }
+}
+
 async function api<T>(path: string): Promise<T> {
   const response = await fetch(`${HOST}${path}`, {
     headers: { authorization: `Basic ${Buffer.from(`${PUBLIC_KEY}:${SECRET_KEY}`).toString('base64')}` },
@@ -56,6 +65,7 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
   it('ingests the exported session and serves the trace tree back through the public API', { timeout: 300_000 }, async () => {
     const fromStartTime = new Date(Date.now() - 5_000).toISOString()
     let sessionIds: string[] = []
+    let feedbackText = ''
     await runLoaderSmoke({
       label: 'dsh-plugin-langfuse-cloud',
       tempDirPrefix: 'dsh-plugin-langfuse-cloud-',
@@ -65,8 +75,12 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
       tsconfigPath: fileURLToPath(new URL('../tsconfig.json', import.meta.url)),
       mode: 'lib',
       inspect: async (cwd) => {
-        const output = JSON.parse(await readFile(join(cwd, 'cloud-session.json'), 'utf8')) as { sessionIds: string[] }
+        const output = JSON.parse(await readFile(join(cwd, 'cloud-session.json'), 'utf8')) as {
+          sessionIds: string[]
+          feedbackText: string
+        }
         sessionIds = output.sessionIds
+        feedbackText = output.feedbackText
       },
     })
     expect(sessionIds.length).toBeGreaterThan(0)
@@ -145,5 +159,33 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
       expect(sessionIds).toContain(row.sessionId)
       expect(row.userId, `observation ${row.name ?? '?'} userId`).toBe('dsh-plugin-langfuse-e2e')
     }
+
+    // The current read API returns one typed `value` and a discriminated
+    // session subject. Poll it separately because trace and Score ingestion
+    // are deliberately independent asynchronous channels.
+    const scoreDeadline = Date.now() + INGESTION_DEADLINE_MS
+    let score: V3Score | undefined
+    for (;;) {
+      const params = new URLSearchParams({
+        fields: 'details,subject',
+        name: 'dsh_user_feedback',
+        sessionId: sessionIds.join(','),
+        fromTimestamp: fromStartTime,
+        limit: '100',
+      })
+      const page = await api<{ data?: V3Score[] }>(`/api/public/v3/scores?${params}`)
+      score = (page.data ?? []).find(row => row.value === feedbackText)
+      if (score !== undefined || Date.now() >= scoreDeadline) break
+      await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
+    }
+    expect(score, `no feedback Score ingested for sessions ${sessionIds.join(', ')} within ${INGESTION_DEADLINE_MS}ms`)
+      .toMatchObject({
+        name: 'dsh_user_feedback',
+        value: feedbackText,
+        dataType: 'TEXT',
+        subject: { kind: 'session' },
+        metadata: { dshTelemetryMode: 'FULL', truncated: false },
+      })
+    expect(sessionIds).toContain(score?.subject?.id)
   })
 })

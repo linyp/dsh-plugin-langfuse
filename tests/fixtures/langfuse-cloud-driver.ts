@@ -10,6 +10,7 @@
 import { writeFile } from 'node:fs/promises'
 import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
 import { runFixtureTurn } from '@deepseek-ai/dsh-loader-smoke'
+import { recordFeedback } from '@deepseek-ai/dsh-command-feedback'
 
 const configPath = process.argv[2]
 if (configPath === undefined) throw new Error('langfuse cloud driver requires a config path')
@@ -20,7 +21,9 @@ try {
   const sessions = ctx.get('sessions')?.list() ?? []
   const sessionIds = sessions.map((session: { id: string }) => session.id)
   if (sessionIds.length === 0) throw new Error('langfuse cloud driver saw no session after the fixture turn')
-  await writeFile('./cloud-session.json', JSON.stringify({ sessionIds }))
+  const feedbackText = `dsh-plugin-langfuse cloud e2e ${Date.now()}`
+  recordFeedback(sessions[0]!, feedbackText)
+  await writeFile('./cloud-session.json', JSON.stringify({ sessionIds, feedbackText }))
 } finally {
   await ctx.fiber.dispose()
 }

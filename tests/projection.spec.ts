@@ -88,6 +88,7 @@ describe('SessionSpanFolder', () => {
     expect(turn.attributes['dsh.session.id']).toBe(SESSION_ID)
     expect(turn.attributes['dsh.trace.deterministic_id']).toBe(createDshTurnTraceId(SESSION_ID, 1))
     expect(turn.attributes['dsh.trace.logical_root']).toBe(true)
+    expect(turn.attributes['langfuse.internal.is_app_root']).toBe(true)
     expect(turn.attributes['langfuse.trace.metadata.dsh_deterministic_trace_id']).toBe(createDshTurnTraceId(SESSION_ID, 1))
     expect(turn.attributes['langfuse.observation.input']).toContain('run the tests')
     expect(turn.attributes['langfuse.observation.output']).toContain('done')

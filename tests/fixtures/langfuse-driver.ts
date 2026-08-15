@@ -12,6 +12,7 @@ import { createServer } from 'node:http'
 import { once } from 'node:events'
 import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
 import { runFixtureTurn } from '@deepseek-ai/dsh-loader-smoke'
+import { recordFeedback } from '@deepseek-ai/dsh-command-feedback'
 
 const configPath = process.argv[2]
 if (configPath === undefined) throw new Error('langfuse driver requires a config path')
@@ -44,10 +45,14 @@ const address = server.address()
 if (address === null || typeof address === 'string') throw new Error('collector has no port')
 // The Langfuse-shaped signal path: the fixture config reads this env url.
 process.env.LANGFUSE_E2E_URL = `http://127.0.0.1:${address.port}/api/public/otel/v1/traces`
+process.env.LANGFUSE_E2E_SCORE_URL = `http://127.0.0.1:${address.port}/api/public/scores`
 
 const ctx = await boot('langfuse-e2e', resolveConfigPath(configPath, undefined))
 try {
   await runFixtureTurn(ctx, { task: 'prove the langfuse trace export' })
+  const session = ctx.get('sessions')?.list()[0]
+  if (session === undefined) throw new Error('langfuse driver saw no session after the fixture turn')
+  recordFeedback(session, 'e2e feedback score')
 } finally {
   await ctx.fiber.dispose()
 }

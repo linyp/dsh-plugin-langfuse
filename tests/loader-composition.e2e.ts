@@ -32,12 +32,23 @@ interface Capture {
   path: string
   authorization: string | undefined
   ingestionVersion: string | undefined
-  body: {
-    resourceSpans?: {
-      resource?: { attributes?: { key: string; value: Record<string, unknown> }[] }
-      scopeSpans?: { scope?: { name?: string }; spans?: OtlpSpan[] }[]
-    }[]
-  }
+  body: unknown
+}
+
+interface OtlpBody {
+  resourceSpans?: {
+    resource?: { attributes?: { key: string; value: Record<string, unknown> }[] }
+    scopeSpans?: { scope?: { name?: string }; spans?: OtlpSpan[] }[]
+  }[]
+}
+
+interface ScoreBody {
+  id: string
+  sessionId: string
+  name: string
+  value: string
+  dataType: string
+  metadata: Record<string, unknown>
 }
 
 function attr(span: OtlpSpan, key: string): unknown {
@@ -57,17 +68,22 @@ describe('dsh-plugin-langfuse REAL composition', () => {
       mode: 'lib',
       inspect: async (cwd) => {
         const captures = JSON.parse(await readFile(join(cwd, 'otlp-captures.json'), 'utf8')) as Capture[]
-        expect(captures.length).toBeGreaterThan(0)
+        expect(captures.length).toBeGreaterThan(1)
 
-        for (const capture of captures) {
+        const otlpCaptures = captures.filter(capture => capture.path === '/api/public/otel/v1/traces')
+        const scoreCaptures = captures.filter(capture => capture.path === '/api/public/scores')
+        expect(otlpCaptures.length).toBeGreaterThan(0)
+        expect(scoreCaptures).toHaveLength(1)
+
+        for (const capture of otlpCaptures) {
           expect(capture.path).toBe('/api/public/otel/v1/traces')
           expect(capture.authorization).toBe(`Basic ${Buffer.from('pk-lf-e2e:sk-lf-e2e').toString('base64')}`)
           // Defaulted so new spans land on Langfuse's v4 data model in real time.
           expect(capture.ingestionVersion).toBe('4')
         }
 
-        const spans = captures.flatMap(capture =>
-          capture.body.resourceSpans?.flatMap(rs => rs.scopeSpans?.flatMap(ss => ss.spans ?? []) ?? []) ?? [])
+        const spans = otlpCaptures.flatMap(capture =>
+          (capture.body as OtlpBody).resourceSpans?.flatMap(rs => rs.scopeSpans?.flatMap(ss => ss.spans ?? []) ?? []) ?? [])
         // The real agent loop numbers turns and steps from 1.
         const names = spans.map(span => span.name)
         expect(names).toContain('turn 1')
@@ -86,6 +102,7 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         expect(turn.parentSpanId).toBe(SYNTHETIC_PARENT_SPAN_ID)
         expect(attr(turn, 'dsh.trace.deterministic_id')).toEqual({ stringValue: turn.traceId })
         expect(attr(turn, 'dsh.trace.logical_root')).toEqual({ boolValue: true })
+        expect(attr(turn, 'langfuse.internal.is_app_root')).toEqual({ boolValue: true })
 
         const generation = spans.find(span => span.name === 'step 1')!
         expect(generation.parentSpanId).toBe(turn.spanId)
@@ -115,6 +132,24 @@ describe('dsh-plugin-langfuse REAL composition', () => {
           expect(attr(span, 'langfuse.trace.metadata.dsh_deterministic_trace_id'), `${span.name} deterministic id`)
             .toEqual({ stringValue: turn.traceId })
         }
+
+        const scoreCapture = scoreCaptures[0]!
+        expect(scoreCapture.authorization).toBe(`Basic ${Buffer.from('pk-lf-e2e:sk-lf-e2e').toString('base64')}`)
+        const score = scoreCapture.body as ScoreBody
+        expect(score).toMatchObject({
+          sessionId: 'e2e-host-session',
+          name: 'dsh_user_feedback',
+          value: 'e2e feedback score',
+          dataType: 'TEXT',
+          metadata: {
+            dshSessionId,
+            dshTelemetryMode: 'FULL',
+            truncated: false,
+          },
+        })
+        expect(score.id).toMatch(/^[0-9a-f]{32}$/)
+        expect(score).not.toHaveProperty('timestamp')
+        expect(score).not.toHaveProperty('stringValue')
       },
     })
   })

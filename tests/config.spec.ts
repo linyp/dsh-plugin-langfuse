@@ -19,6 +19,7 @@ import {
 
 const AUTH = { publicKey: 'pk-lf-test', secretKey: 'sk-lf-test' }
 const URL_OK = 'https://cloud.langfuse.com/api/public/otel/v1/traces'
+const SCORE_URL_OK = 'https://cloud.langfuse.com/api/public/scores'
 
 function construct(config: Config): LangfuseSessionTelemetryBackend {
   return new LangfuseSessionTelemetryBackend(new Context(), config)
@@ -35,6 +36,18 @@ describe('config validation', () => {
     expect(DEFAULT_TELEMETRY_MODE).toBe(LangfuseTelemetryMode.DISABLED)
     const backend = construct({})
     expect(backend.sharing).toBe('disabled')
+  })
+
+  it('does not inspect Score transport config when the entire plugin is DISABLED', () => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.DISABLED,
+      feedbackScores: {
+        enabled: true,
+        url: 'not a url',
+        maxQueueSize: 0,
+        requestTimeoutMillis: 0,
+      },
+    })).not.toThrow()
   })
 
   it('requires exporter.url in uploading modes', () => {
@@ -90,6 +103,45 @@ describe('config validation', () => {
       exporter: { url: URL_OK },
       shutdownTimeoutMillis: 0,
     })).toThrow(/shutdownTimeoutMillis/)
+  })
+
+  it('requires a Score URL only when feedback Scores are enabled', () => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.FULL,
+      auth: AUTH,
+      exporter: { url: URL_OK },
+      feedbackScores: { enabled: true },
+    })).toThrow(/feedbackScores\.url is required/)
+  })
+
+  it.each([
+    ['not a url', /not a valid URL/],
+    ['grpc://cloud.langfuse.com/api/public/scores', /must be http\(s\)/],
+  ])('rejects invalid enabled Score URL %j', (url, expected) => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.FULL,
+      auth: AUTH,
+      exporter: { url: URL_OK },
+      feedbackScores: { enabled: true, url },
+    })).toThrow(expected)
+  })
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1])('rejects invalid Score maxQueueSize %j', (maxQueueSize) => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.FULL,
+      auth: AUTH,
+      exporter: { url: URL_OK },
+      feedbackScores: { enabled: true, url: SCORE_URL_OK, maxQueueSize },
+    })).toThrow(/feedbackScores\.maxQueueSize/)
+  })
+
+  it.each([0, -1, Number.POSITIVE_INFINITY])('rejects invalid Score requestTimeoutMillis %j', (requestTimeoutMillis) => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.FULL,
+      auth: AUTH,
+      exporter: { url: URL_OK },
+      feedbackScores: { enabled: true, url: SCORE_URL_OK, requestTimeoutMillis },
+    })).toThrow(/feedbackScores\.requestTimeoutMillis/)
   })
 
   it('rejects an unknown mode smuggled past the schema by direct construction', () => {

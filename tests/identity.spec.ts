@@ -115,6 +115,10 @@ describe('TelemetryIdentityRegistry', () => {
       rootSpanContext,
     })
     expect(registry.getLatestLangfuseSessionId('session-a')).toBe('host-session-a')
+    expect(registry.resolveScoreSession('session-a')).toEqual({
+      langfuseSessionId: 'host-session-a',
+      ambiguous: false,
+    })
 
     // A repeated start for the same canonical turn cannot silently move it
     // under a different upstream trace within this process.
@@ -128,6 +132,17 @@ describe('TelemetryIdentityRegistry', () => {
     expect(repeated).toBe(identity)
     expect(repeated.source).toBe('deterministic')
     expect(registry.getLatestLangfuseSessionId('session-a')).toBe('host-session-a')
+
+    registry.beginTurn({
+      dshSessionId: 'session-a',
+      turn: 2,
+      startSeq: 10,
+      langfuseSessionId: 'host-session-b',
+    })
+    expect(registry.resolveScoreSession('session-a')).toEqual({
+      langfuseSessionId: 'host-session-b',
+      ambiguous: true,
+    })
   })
 
   it('bounds session/turn state and emits each diagnostic at most once', () => {

@@ -29,6 +29,9 @@
     auth:
       publicKey: pk-lf-e2e
       secretKey: sk-lf-e2e
+    feedbackScores:
+      enabled: true
+      url: !!js process.env.LANGFUSE_E2E_SCORE_URL
     correlation:
       userId: e2e-host-user
       sessionId: e2e-host-session

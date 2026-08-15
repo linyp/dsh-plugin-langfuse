@@ -4,7 +4,7 @@
  * producer, capture coordinator, backend, and folding projection stay intact.
  */
 
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TraceFlags } from '@opentelemetry/api'
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base'
 
@@ -41,6 +41,7 @@ import {
   LangfuseSessionTelemetryBackend,
   LangfuseTelemetryMode,
   createDshTurnTraceId,
+  type Config,
 } from '../src/index.ts'
 
 interface CapturedPipeline {
@@ -60,6 +61,10 @@ beforeEach(() => {
   pipelines.length = 0
 })
 
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
 function appendTurn(session: Session): void {
   session.append('turn/start', { turn: 1 })
   session.append('user/message', USER_MESSAGE, { surfaceOp: 'append' })
@@ -74,7 +79,7 @@ function appendTurn(session: Session): void {
   session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
 }
 
-async function mount(mode: LangfuseTelemetryMode): Promise<{
+async function mount(mode: LangfuseTelemetryMode, feedbackScores?: Config['feedbackScores']): Promise<{
   ctx: Context
   session: Session
   pipeline: CapturedPipeline
@@ -85,6 +90,7 @@ async function mount(mode: LangfuseTelemetryMode): Promise<{
     mode,
     exporter: { url: 'https://example.invalid/api/public/otel/v1/traces' },
     auth: { publicKey: 'pk-test', secretKey: 'sk-test' },
+    feedbackScores,
   })
   const pipeline = pipelines.at(-1) as CapturedPipeline | undefined
   if (pipeline === undefined) throw new Error('test OTel pipeline was not constructed')
@@ -200,5 +206,111 @@ describe('LangfuseSessionTelemetryBackend', () => {
       .toBe(createDshTurnTraceId('feedback-replay', 1))
 
     await mounted.ctx.fiber.dispose()
+  })
+
+  it('sends only canonical FEEDBACK_ONLY consent as a Score', async () => {
+    const requests: RequestInit[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init !== undefined) requests.push(init)
+      return new Response('{}', { status: 201 })
+    }))
+    const mounted = await mount(LangfuseTelemetryMode.FEEDBACK_ONLY, {
+      enabled: true,
+      url: 'https://example.invalid/api/public/scores',
+    })
+    appendTurn(mounted.session)
+
+    const forged = {
+      type: 'feedback/record',
+      seq: 999,
+      time: Date.now(),
+      data: { text: 'forged' },
+    } as SessionEvent<'feedback/record'>
+    mounted.ctx.emit('session/event', mounted.session, forged)
+    expect(requests).toHaveLength(0)
+
+    recordFeedback(mounted.session, 'canonical feedback')
+    await mounted.ctx.fiber.dispose()
+
+    expect(requests).toHaveLength(1)
+    expect(JSON.parse(String(requests[0]?.body))).toMatchObject({
+      sessionId: 'feedback-replay',
+      name: 'dsh_user_feedback',
+      value: 'canonical feedback',
+      dataType: 'TEXT',
+      metadata: { dshTelemetryMode: 'FEEDBACK_ONLY' },
+    })
+  })
+
+  it('uses the post-waterfall redacted text and feedback-level subject', async () => {
+    const requests: RequestInit[] = []
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if (init !== undefined) requests.push(init)
+      return new Response('{}', { status: 201 })
+    }))
+    const mounted = await mount(LangfuseTelemetryMode.FULL, {
+      enabled: true,
+      url: 'https://example.invalid/api/public/scores',
+    })
+    mounted.ctx.on('session-telemetry/record', (record, next) => {
+      const outbound = next()
+      if (outbound.attributes['event.type'] !== 'feedback/record') return outbound
+      return {
+        ...outbound,
+        attributes: {
+          ...outbound.attributes,
+          'langfuse.session.id': 'feedback-subject',
+        },
+        body: { text: '[redacted by host]' },
+      }
+    })
+
+    appendTurn(mounted.session)
+    recordFeedback(mounted.session, 'raw secret feedback')
+    expect(mounted.pipeline.exporter.getFinishedSpans().length).toBeGreaterThan(0)
+    await mounted.ctx.fiber.dispose()
+
+    const body = JSON.parse(String(requests[0]?.body)) as Record<string, unknown>
+    expect(requests).toHaveLength(1)
+    expect(body).toMatchObject({
+      sessionId: 'feedback-subject',
+      value: '[redacted by host]',
+    })
+    expect(JSON.stringify(body)).not.toContain('raw secret feedback')
+  })
+
+  it('does not send feedback withheld by a throwing fail-closed waterfall rule', async () => {
+    const fetcher = vi.fn(async () => new Response('{}', { status: 201 }))
+    vi.stubGlobal('fetch', fetcher)
+    const mounted = await mount(LangfuseTelemetryMode.FULL, {
+      enabled: true,
+      url: 'https://example.invalid/api/public/scores',
+    })
+    mounted.ctx.on('session-telemetry/record', (record, next) => {
+      const outbound = next()
+      if (outbound.attributes['event.type'] === 'feedback/record') throw new Error('withhold feedback')
+      return outbound
+    })
+
+    appendTurn(mounted.session)
+    expect(() => recordFeedback(mounted.session, 'must remain local')).not.toThrow()
+    await mounted.ctx.fiber.dispose()
+
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('keeps trace shutdown successful when the Score endpoint rejects a payload', async () => {
+    const fetcher = vi.fn(async () => new Response('{}', { status: 400 }))
+    vi.stubGlobal('fetch', fetcher)
+    const mounted = await mount(LangfuseTelemetryMode.FULL, {
+      enabled: true,
+      url: 'https://example.invalid/api/public/scores',
+    })
+    appendTurn(mounted.session)
+    recordFeedback(mounted.session, 'will fail remotely')
+    expect(mounted.pipeline.exporter.getFinishedSpans().length).toBeGreaterThan(0)
+
+    await expect(mounted.ctx.fiber.dispose()).resolves.toBeUndefined()
+    expect(fetcher).toHaveBeenCalledOnce()
   })
 })

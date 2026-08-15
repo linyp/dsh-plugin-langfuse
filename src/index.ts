@@ -29,10 +29,34 @@ import type { OTLPExporterNodeConfigBase } from '@opentelemetry/otlp-exporter-ba
 import type { BufferConfig } from '@opentelemetry/sdk-trace-base'
 import { TelemetryIdentityRegistry } from './identity-registry.ts'
 import { buildBasicAuthHeader, buildTracerPipeline, type TracerPipeline } from './otel.ts'
+import { LangfuseTelemetryPipeline } from './pipeline.ts'
 import { DEFAULT_MAX_ATTRIBUTE_CHARS, SessionSpanFolder, type CorrelationConfig } from './projection.ts'
+import {
+  DEFAULT_SCORE_QUEUE_SIZE,
+  DEFAULT_SCORE_REQUEST_TIMEOUT_MILLIS,
+  FeedbackScoreSink,
+  LangfuseScoreHttpTransport,
+} from './score.ts'
 
 export { DEFAULT_MAX_ATTRIBUTE_CHARS, type CorrelationConfig }
-export { createDshTurnTraceId, TRACEPARENT_ATTRIBUTE, TRACESTATE_ATTRIBUTE } from './identity.ts'
+export {
+  createDshFeedbackScoreId,
+  createDshTurnTraceId,
+  TRACEPARENT_ATTRIBUTE,
+  TRACESTATE_ATTRIBUTE,
+} from './identity.ts'
+export {
+  DEFAULT_SCORE_QUEUE_SIZE,
+  DEFAULT_SCORE_REQUEST_TIMEOUT_MILLIS,
+  FEEDBACK_SCORE_NAME,
+  FeedbackScoreSink,
+  LangfuseScoreHttpTransport,
+  MAX_TEXT_SCORE_CHARS,
+  ScoreTransportError,
+  mapFeedbackRecord,
+  type ScoreTransport,
+  type SessionTextScore,
+} from './score.ts'
 
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string }
 
@@ -118,6 +142,17 @@ export interface Config {
    * redaction waterfall — it transforms records, and these never transit one.
    */
   correlation?: CorrelationConfig
+  /**
+   * Optional delivery of canonical `feedback/record` values as Langfuse
+   * session-level TEXT Scores. Disabled by default and failure-isolated from
+   * trace export. `url` is the full `/api/public/scores` endpoint.
+   */
+  feedbackScores?: {
+    enabled?: boolean
+    url?: string
+    maxQueueSize?: number
+    requestTimeoutMillis?: number
+  }
   /** Passed verbatim to `BatchSpanProcessor`; the SDK owns and documents these knobs. */
   processor?: BufferConfig
   /**
@@ -146,6 +181,12 @@ export const Config: z<Config> = z.object({
     userId: z.string(),
     sessionId: z.string(),
   }),
+  feedbackScores: z.object({
+    enabled: z.boolean(),
+    url: z.string(),
+    maxQueueSize: z.number(),
+    requestTimeoutMillis: z.number(),
+  }),
   processor: z.any(),
   maxAttributeChars: z.number(),
   shutdownTimeoutMillis: z.number(),
@@ -171,8 +212,7 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
   static Config = Config
 
   private readonly directEmit: SessionTelemetrySink['emit']
-  private readonly pipeline: TracerPipeline | undefined
-  private readonly folder: SessionSpanFolder | undefined
+  private readonly telemetryPipeline: LangfuseTelemetryPipeline | undefined
   private readonly shutdownTimeoutMillis: number
   override readonly sharing: SessionTelemetrySharingStatus
 
@@ -182,8 +222,7 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
     this.sharing = sharingStatusFor(mode)
     if (mode === LangfuseTelemetryMode.DISABLED) {
       this.directEmit = DROP_RECORD
-      this.pipeline = undefined
-      this.folder = undefined
+      this.telemetryPipeline = undefined
       this.shutdownTimeoutMillis = DEFAULT_SHUTDOWN_TIMEOUT_MILLIS
       ctx.on('session/event', (_session, event) => {
         if (event.type === 'feedback/record') ctx.logger.warn(DISABLED_FEEDBACK_WARNING)
@@ -205,8 +244,10 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
       throw new Error(`dsh-plugin-langfuse: exporter.url must be http(s), got ${parsed.protocol}`)
     }
-    const headers = withDefaultIngestionVersion(resolveAuthHeaders(config))
+    const authHeaders = resolveAuthHeaders(config)
+    const headers = withDefaultIngestionVersion(authHeaders)
     const correlation = validateCorrelation(config)
+    const feedbackScores = validateFeedbackScores(config)
     const batchSize = config.processor?.maxExportBatchSize
     if (batchSize !== undefined && (!Number.isInteger(batchSize) || batchSize < 1)) {
       throw new Error(`dsh-plugin-langfuse: processor.maxExportBatchSize must be a positive integer, got ${String(batchSize)}`)
@@ -220,7 +261,10 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
       throw new Error(`dsh-plugin-langfuse: shutdownTimeoutMillis must be a positive finite number no greater than ${MAX_TIMER_DELAY_MILLIS}, got ${String(shutdownTimeoutMillis)}`)
     }
     this.shutdownTimeoutMillis = shutdownTimeoutMillis
-    this.pipeline = buildTracerPipeline({
+    const identityRegistry = new TelemetryIdentityRegistry({
+      onWarning: message => ctx.logger.warn(message),
+    })
+    const otelPipeline: TracerPipeline = buildTracerPipeline({
       exporter: { ...config.exporter, url, headers },
       processor: config.processor,
       resourceAttributes: {
@@ -230,16 +274,32 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
       scopeName: 'dsh-plugin-langfuse',
       scopeVersion: version,
     })
-    const identityRegistry = new TelemetryIdentityRegistry({
-      onWarning: message => ctx.logger.warn(message),
-    })
-    const folder = new SessionSpanFolder(this.pipeline.tracer, {
+    const folder = new SessionSpanFolder(otelPipeline.tracer, {
       maxAttributeChars,
       correlation,
       identityRegistry,
     })
-    this.folder = folder
-    const enqueue: SessionTelemetrySink['emit'] = (record: SessionTelemetryRecord) => folder.fold(record)
+    const scoreSink = feedbackScores === undefined
+      ? undefined
+      : new FeedbackScoreSink({
+          transport: new LangfuseScoreHttpTransport({
+            url: feedbackScores.url,
+            headers: authHeaders,
+            requestTimeoutMillis: feedbackScores.requestTimeoutMillis,
+          }),
+          identityRegistry,
+          mode,
+          staticSessionId: correlation?.sessionId,
+          maxQueueSize: feedbackScores.maxQueueSize,
+          onWarning: message => ctx.logger.warn(message),
+        })
+    const telemetryPipeline = new LangfuseTelemetryPipeline({
+      folder,
+      scoreSink,
+      shutdownTraces: () => otelPipeline.provider.shutdown(),
+    })
+    this.telemetryPipeline = telemetryPipeline
+    const enqueue: SessionTelemetrySink['emit'] = record => telemetryPipeline.emit(record)
     const backend: SessionTelemetrySink = {
       emit: enqueue,
       shutdown: () => this.shutdown(),
@@ -278,30 +338,73 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
   // source of concurrent flushes against shutdown's internal drain.
 
   /**
-   * Sweep open spans closed, then ask the SDK to drain and quiesce, but
-   * reject after the plugin-owned deadline: the SDK's export timeout does not
-   * bound its preceding `forceFlush()` wait, which can remain pending when
-   * the transport never obtains a socket. The provider promise remains
-   * observed after the deadline so a later rejection cannot become unhandled.
+   * Sweep open spans closed, then concurrently drain the OTel provider and
+   * Score queue under one plugin-owned deadline. The SDK's export timeout
+   * does not bound its preceding `forceFlush()` wait, which can remain pending
+   * when the transport never obtains a socket. Both promises remain observed
+   * after the deadline so later rejections cannot become unhandled.
    * `DISABLED` has no pipeline and resolves immediately.
-   * @returns resolves when the SDK pipeline quiesces or is disabled, or rejects at the configured deadline.
+   * @returns resolves when both channels quiesce or are disabled, or rejects at the configured deadline.
    */
   async shutdown(): Promise<void> {
-    if (this.pipeline === undefined) return
-    this.folder?.endAll(Date.now())
-    const providerShutdown = this.pipeline.provider.shutdown()
+    if (this.telemetryPipeline === undefined) return
+    const telemetryShutdown = this.telemetryPipeline.shutdown()
     let timer: ReturnType<typeof setTimeout> | undefined
     const deadline = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
-        reject(new Error(`dsh-plugin-langfuse: provider shutdown exceeded ${this.shutdownTimeoutMillis}ms`))
+        reject(new Error(`dsh-plugin-langfuse: telemetry shutdown exceeded ${this.shutdownTimeoutMillis}ms`))
       }, this.shutdownTimeoutMillis)
     })
     try {
-      await Promise.race([providerShutdown, deadline])
+      await Promise.race([telemetryShutdown, deadline])
     } finally {
       if (timer !== undefined) clearTimeout(timer)
     }
   }
+}
+
+interface ResolvedFeedbackScoresConfig {
+  url: string
+  maxQueueSize: number
+  requestTimeoutMillis: number
+}
+
+/** Validate the opt-in Score channel before constructing either transport. */
+function validateFeedbackScores(config: Config): ResolvedFeedbackScoresConfig | undefined {
+  const value = config.feedbackScores
+  if (value === undefined) return undefined
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`dsh-plugin-langfuse: feedbackScores must be an object, got ${JSON.stringify(value)}`)
+  }
+  const enabled = value.enabled ?? false
+  if (typeof enabled !== 'boolean') {
+    throw new Error(`dsh-plugin-langfuse: feedbackScores.enabled must be a boolean, got ${JSON.stringify(enabled)}`)
+  }
+  if (!enabled) return undefined
+
+  const url = value.url
+  if (typeof url !== 'string' || url.length === 0) {
+    throw new Error('dsh-plugin-langfuse: feedbackScores.url is required when feedbackScores.enabled is true (the full https://.../api/public/scores endpoint)')
+  }
+  let parsed: URL
+  try {
+    parsed = new URL(url)
+  } catch {
+    throw new Error(`dsh-plugin-langfuse: feedbackScores.url is not a valid URL: ${JSON.stringify(url)}`)
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`dsh-plugin-langfuse: feedbackScores.url must be http(s), got ${parsed.protocol}`)
+  }
+
+  const maxQueueSize = value.maxQueueSize ?? DEFAULT_SCORE_QUEUE_SIZE
+  if (!Number.isSafeInteger(maxQueueSize) || maxQueueSize < 1) {
+    throw new Error(`dsh-plugin-langfuse: feedbackScores.maxQueueSize must be a positive safe integer, got ${String(maxQueueSize)}`)
+  }
+  const requestTimeoutMillis = value.requestTimeoutMillis ?? DEFAULT_SCORE_REQUEST_TIMEOUT_MILLIS
+  if (!Number.isFinite(requestTimeoutMillis) || requestTimeoutMillis <= 0 || requestTimeoutMillis > MAX_TIMER_DELAY_MILLIS) {
+    throw new Error(`dsh-plugin-langfuse: feedbackScores.requestTimeoutMillis must be a positive finite number no greater than ${MAX_TIMER_DELAY_MILLIS}, got ${String(requestTimeoutMillis)}`)
+  }
+  return { url, maxQueueSize, requestTimeoutMillis }
 }
 
 /** Header selecting Langfuse's ingestion pipeline version. */

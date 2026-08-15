@@ -26,3 +26,8 @@
         auth:
           publicKey: !!js process.env.LANGFUSE_PUBLIC_KEY
           secretKey: !!js process.env.LANGFUSE_SECRET_KEY
+        feedbackScores:
+          # The bundled deployment enables feedback Scores only when direct
+          # Langfuse credentials are present. Library default remains opt-in.
+          enabled: !!js Boolean(process.env.LANGFUSE_PUBLIC_KEY && process.env.LANGFUSE_SECRET_KEY)
+          url: !!js (process.env.LANGFUSE_HOST ?? 'https://cloud.langfuse.com') + '/api/public/scores'
