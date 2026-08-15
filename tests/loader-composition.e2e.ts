@@ -14,6 +14,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { LOADER_SMOKE_TEST_TIMEOUT_MS, runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
+import { SYNTHETIC_PARENT_SPAN_ID, createDshTurnTraceId } from '../src/identity.ts'
 
 const driver = fileURLToPath(new URL('./fixtures/langfuse-driver.ts', import.meta.url))
 const configPath = fileURLToPath(new URL('./fixtures/langfuse.cordis.yml', import.meta.url))
@@ -22,6 +23,7 @@ interface OtlpSpan {
   name: string
   parentSpanId?: string
   spanId: string
+  traceId: string
   attributes?: { key: string; value: Record<string, unknown> }[]
   status?: { code?: number }
 }
@@ -79,6 +81,11 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         expect(attr(turn, 'langfuse.trace.input')).toBeDefined()
         expect(attr(turn, 'langfuse.trace.output')).toBeDefined()
         expect(attr(turn, 'dsh.session.id')).toBeDefined()
+        const dshSessionId = (attr(turn, 'dsh.session.id') as { stringValue: string }).stringValue
+        expect(turn.traceId).toBe(createDshTurnTraceId(dshSessionId, 1))
+        expect(turn.parentSpanId).toBe(SYNTHETIC_PARENT_SPAN_ID)
+        expect(attr(turn, 'dsh.trace.deterministic_id')).toEqual({ stringValue: turn.traceId })
+        expect(attr(turn, 'dsh.trace.logical_root')).toEqual({ boolValue: true })
 
         const generation = spans.find(span => span.name === 'step 1')!
         expect(generation.parentSpanId).toBe(turn.spanId)
@@ -105,6 +112,8 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         for (const span of [turn, generation, tool]) {
           expect(attr(span, 'langfuse.session.id'), `${span.name} session`).toEqual({ stringValue: 'e2e-host-session' })
           expect(attr(span, 'langfuse.user.id'), `${span.name} user`).toEqual({ stringValue: 'e2e-host-user' })
+          expect(attr(span, 'langfuse.trace.metadata.dsh_deterministic_trace_id'), `${span.name} deterministic id`)
+            .toEqual({ stringValue: turn.traceId })
         }
       },
     })

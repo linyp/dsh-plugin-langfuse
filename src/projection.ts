@@ -22,11 +22,15 @@
  * the resolved identity rides every span; the original dsh session id stays
  * on the turn root as `dsh.session.id`.
  *
+ * Trace identity: every turn derives a versioned Trace ID from the original
+ * dsh session id plus turn number. A valid `traceparent`/`tracestate` carried
+ * by `turn/start` wins and nests the DSH subtree under the embedding host;
+ * the deterministic id remains an attribute for reverse correlation.
+ *
  * @module dsh-plugin-langfuse/projection
  */
 
 import {
-  ROOT_CONTEXT,
   SpanStatusCode,
   trace,
   type Context as OtelContext,
@@ -35,11 +39,15 @@ import {
 } from '@opentelemetry/api'
 import type { SessionEventMap } from '@deepseek-ai/dsh-session'
 import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
+import { TelemetryIdentityRegistry, type TurnIdentity } from './identity-registry.ts'
+import { TRACEPARENT_ATTRIBUTE, TRACESTATE_ATTRIBUTE } from './identity.ts'
 import {
   ATTR_DSH_EVENT_SEQ,
   ATTR_DSH_FORCE_ENDED,
   ATTR_DSH_SESSION_ID,
   ATTR_DSH_STEP,
+  ATTR_DSH_TRACE_DETERMINISTIC_ID,
+  ATTR_DSH_TRACE_LOGICAL_ROOT,
   ATTR_DSH_TURN,
   ATTR_DSH_TURN_END_REASON,
   ATTR_GEN_AI_PROVIDER_NAME,
@@ -52,6 +60,7 @@ import {
   ATTR_LANGFUSE_OBSERVATION_TYPE,
   ATTR_LANGFUSE_SESSION_ID,
   ATTR_LANGFUSE_TRACE_INPUT,
+  ATTR_LANGFUSE_TRACE_METADATA_DSH_DETERMINISTIC_TRACE_ID,
   ATTR_LANGFUSE_TRACE_NAME,
   ATTR_LANGFUSE_TRACE_OUTPUT,
   ATTR_LANGFUSE_USER_ID,
@@ -92,11 +101,15 @@ interface TurnCorrelation {
   dshSessionId: string
 }
 
-/** The `langfuse.*` identity every span carries for v4 per-observation queries. */
-function identityAttributes(correlation: TurnCorrelation): Record<string, string> {
+/** Trace-wide identity every span carries for v4 per-observation queries. */
+function identityAttributes(correlation: TurnCorrelation, identity?: TurnIdentity): Record<string, string> {
   return {
     [ATTR_LANGFUSE_SESSION_ID]: correlation.langfuseSessionId,
     ...correlation.userId === undefined ? {} : { [ATTR_LANGFUSE_USER_ID]: correlation.userId },
+    ...identity === undefined ? {} : {
+      [ATTR_DSH_TRACE_DETERMINISTIC_ID]: identity.deterministicTraceId,
+      [ATTR_LANGFUSE_TRACE_METADATA_DSH_DETERMINISTIC_TRACE_ID]: identity.deterministicTraceId,
+    },
   }
 }
 
@@ -126,6 +139,8 @@ interface TurnState {
   currentStep?: StepState
   /** Identity locked at `turn/start`; later records cannot change it. */
   correlation: TurnCorrelation
+  /** Stable trace identity plus the explicit parent selected at turn/start. */
+  identity: TurnIdentity
 }
 
 interface SessionState {
@@ -139,6 +154,12 @@ function body<T extends keyof SessionEventMap>(record: SessionTelemetryRecord): 
   return record.body as SessionEventMap[T]
 }
 
+export interface SessionSpanFolderOptions {
+  maxAttributeChars?: number
+  correlation?: CorrelationConfig
+  identityRegistry?: TelemetryIdentityRegistry
+}
+
 /**
  * Folds seam records into OTel spans through the given tracer. One folder
  * instance serves every session the backend observes; state is per
@@ -148,10 +169,12 @@ export class SessionSpanFolder {
   private readonly sessions = new Map<string, SessionState>()
   private readonly maxAttributeChars: number
   private readonly correlation: CorrelationConfig | undefined
+  private readonly identityRegistry: TelemetryIdentityRegistry
 
-  constructor(private readonly tracer: Tracer, options?: { maxAttributeChars?: number; correlation?: CorrelationConfig }) {
+  constructor(private readonly tracer: Tracer, options?: SessionSpanFolderOptions) {
     this.maxAttributeChars = options?.maxAttributeChars ?? DEFAULT_MAX_ATTRIBUTE_CHARS
     this.correlation = options?.correlation
+    this.identityRegistry = options?.identityRegistry ?? new TelemetryIdentityRegistry()
   }
 
   /**
@@ -207,24 +230,34 @@ export class SessionSpanFolder {
         // (crash window or dropped record); close it before opening the next.
         if (state.turn !== undefined) this.endTurn(state, record.time, true)
         const correlation = this.resolveCorrelation(record, sessionId)
+        const identity = this.identityRegistry.beginTurn({
+          dshSessionId: sessionId,
+          turn,
+          startSeq: Number(record.attributes['event.seq']),
+          langfuseSessionId: correlation.langfuseSessionId,
+          traceparent: record.attributes[TRACEPARENT_ATTRIBUTE],
+          tracestate: record.attributes[TRACESTATE_ATTRIBUTE],
+        })
         const span = this.tracer.startSpan(`turn ${turn}`, {
           startTime: record.time,
-          root: true,
           attributes: {
-            ...identityAttributes(correlation),
+            ...identityAttributes(correlation, identity),
             [ATTR_DSH_SESSION_ID]: correlation.dshSessionId,
+            [ATTR_DSH_TRACE_LOGICAL_ROOT]: true,
             [ATTR_LANGFUSE_TRACE_NAME]: `dsh turn ${turn}`,
             [ATTR_DSH_TURN]: turn,
             [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
           },
-        }, ROOT_CONTEXT)
+        }, identity.parentContext)
+        this.identityRegistry.registerRootSpan(identity, span.spanContext())
         state.turn = {
           span,
-          context: trace.setSpan(ROOT_CONTEXT, span),
+          context: trace.setSpan(identity.parentContext, span),
           turn,
           steps: new Map(),
           tools: new Map(),
           correlation,
+          identity,
         }
         return
       }
@@ -246,7 +279,7 @@ export class SessionSpanFolder {
           startTime: record.time,
           attributes: {
             [ATTR_LANGFUSE_OBSERVATION_TYPE]: 'generation',
-            ...identityAttributes(state.turn.correlation),
+            ...identityAttributes(state.turn.correlation, state.turn.identity),
             [ATTR_DSH_TURN]: turn,
             [ATTR_DSH_STEP]: step,
             [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
@@ -310,7 +343,7 @@ export class SessionSpanFolder {
           startTime: record.time,
           attributes: {
             [ATTR_LANGFUSE_OBSERVATION_TYPE]: 'tool',
-            ...identityAttributes(state.turn.correlation),
+            ...identityAttributes(state.turn.correlation, state.turn.identity),
             [ATTR_GEN_AI_TOOL_NAME]: name,
             [ATTR_GEN_AI_TOOL_CALL_ID]: String(callId),
             [ATTR_LANGFUSE_OBSERVATION_INPUT]: this.clip(args),
@@ -338,7 +371,7 @@ export class SessionSpanFolder {
         const { reason } = body<'turn/end'>(record)
         state.turn.span.setAttribute(ATTR_DSH_TURN_END_REASON, this.clip(reason))
         if (record.severity === 'error') state.turn.span.setStatus({ code: SpanStatusCode.ERROR })
-        this.endTurn(state, record.time, false)
+        this.endTurn(state, record.time, false, Number(record.attributes['event.seq']))
         return
       }
       default: {
@@ -385,7 +418,7 @@ export class SessionSpanFolder {
   }
 
   /** End the open turn and everything still open beneath it. */
-  private endTurn(state: SessionState, time: number, forced: boolean): void {
+  private endTurn(state: SessionState, time: number, forced: boolean, endSeq?: number): void {
     const turn = state.turn
     if (turn === undefined) return
     for (const [, stepState] of turn.steps) {
@@ -398,6 +431,7 @@ export class SessionSpanFolder {
     }
     if (forced) turn.span.setAttribute(ATTR_DSH_FORCE_ENDED, true)
     turn.span.end(time)
+    this.identityRegistry.completeTurn(turn.identity, { endSeq, forced })
     state.turn = undefined
   }
 

@@ -6,7 +6,7 @@
  */
 
 import { beforeEach, describe, expect, it } from 'vitest'
-import { SpanStatusCode } from '@opentelemetry/api'
+import { SpanStatusCode, TraceFlags } from '@opentelemetry/api'
 import {
   BasicTracerProvider,
   InMemorySpanExporter,
@@ -14,6 +14,7 @@ import {
   type ReadableSpan,
 } from '@opentelemetry/sdk-trace-base'
 import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
+import { createDshTurnTraceId, SYNTHETIC_PARENT_SPAN_ID } from '../src/identity.ts'
 import { SessionSpanFolder } from '../src/projection.ts'
 
 const SESSION_ID = 'ses-test-1'
@@ -77,9 +78,17 @@ describe('SessionSpanFolder', () => {
     expect([...spans.keys()].sort()).toEqual(['step 0', 'tool bash', 'turn 1'])
 
     const turn = spans.get('turn 1')!
-    expect(turn.parentSpanContext).toBeUndefined()
+    expect(turn.spanContext().traceId).toBe(createDshTurnTraceId(SESSION_ID, 1))
+    expect(turn.parentSpanContext).toMatchObject({
+      traceId: createDshTurnTraceId(SESSION_ID, 1),
+      spanId: SYNTHETIC_PARENT_SPAN_ID,
+      traceFlags: TraceFlags.SAMPLED,
+    })
     expect(turn.attributes['langfuse.session.id']).toBe(SESSION_ID)
     expect(turn.attributes['dsh.session.id']).toBe(SESSION_ID)
+    expect(turn.attributes['dsh.trace.deterministic_id']).toBe(createDshTurnTraceId(SESSION_ID, 1))
+    expect(turn.attributes['dsh.trace.logical_root']).toBe(true)
+    expect(turn.attributes['langfuse.trace.metadata.dsh_deterministic_trace_id']).toBe(createDshTurnTraceId(SESSION_ID, 1))
     expect(turn.attributes['langfuse.observation.input']).toContain('run the tests')
     expect(turn.attributes['langfuse.observation.output']).toContain('done')
     // Deprecated aliases remain while trace-level evaluators migrate to the
@@ -96,6 +105,7 @@ describe('SessionSpanFolder', () => {
     // Langfuse v4 filters and aggregates per observation, so identity rides
     // every span, not only the trace root.
     expect(step.attributes['langfuse.session.id']).toBe(SESSION_ID)
+    expect(step.attributes['langfuse.trace.metadata.dsh_deterministic_trace_id']).toBe(createDshTurnTraceId(SESSION_ID, 1))
     expect(step.attributes['gen_ai.request.model']).toBe('deepseek-chat')
     expect(step.attributes['gen_ai.provider.name']).toBe('deepseek')
     expect(step.attributes['gen_ai.usage.input_tokens']).toBe(16)
@@ -113,6 +123,7 @@ describe('SessionSpanFolder', () => {
     expect(tool.parentSpanContext?.spanId).toBe(step.spanContext().spanId)
     expect(tool.attributes['langfuse.observation.type']).toBe('tool')
     expect(tool.attributes['langfuse.session.id']).toBe(SESSION_ID)
+    expect(tool.attributes['langfuse.trace.metadata.dsh_deterministic_trace_id']).toBe(createDshTurnTraceId(SESSION_ID, 1))
     expect(tool.attributes['gen_ai.tool.name']).toBe('bash')
     expect(tool.attributes['gen_ai.tool.call.id']).toBe('call-1')
     expect(tool.attributes['langfuse.observation.output']).toContain('ok')
@@ -297,6 +308,47 @@ describe('SessionSpanFolder', () => {
     expect(spans.get('step 0')!.attributes['langfuse.user.id']).toBe('dynamic-user')
     expect(spans.get('turn 2')!.attributes['langfuse.session.id']).toBe('config-session')
     expect(spans.get('turn 2')!.attributes['langfuse.user.id']).toBe('config-user')
+  })
+
+  it('joins an external per-turn W3C parent while preserving DSH logical identity', () => {
+    const traceId = '4bf92f3577b34da6a3ce929d0e0e4736'
+    const parentSpanId = '00f067aa0ba902b7'
+    const secondTraceId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    const secondParentSpanId = 'bbbbbbbbbbbbbbbb'
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }, 'info', {
+      traceparent: `00-${traceId}-${parentSpanId}-01`,
+      tracestate: 'vendor=value',
+    }))
+    folder.fold(ledger('step/start', 2, 1_010, { turn: 1, step: 0 }))
+    folder.fold(ledger('step/end', 3, 1_020, { turn: 1, step: 0 }))
+    folder.fold(ledger('turn/end', 4, 1_030, { turn: 1, reason: { kind: 'completed' } }))
+    // The same long-lived receiver can join a different host parent for the
+    // next turn without inheriting the previous turn's process-local state.
+    folder.fold(ledger('turn/start', 5, 2_000, { turn: 2 }, 'info', {
+      traceparent: `00-${secondTraceId}-${secondParentSpanId}-01`,
+    }))
+    folder.fold(ledger('turn/end', 6, 2_010, { turn: 2, reason: { kind: 'completed' } }))
+
+    const spans = spansByName()
+    const turn = spans.get('turn 1')!
+    expect(turn.spanContext().traceId).toBe(traceId)
+    expect(turn.parentSpanContext).toMatchObject({
+      traceId,
+      spanId: parentSpanId,
+      traceFlags: TraceFlags.SAMPLED,
+      isRemote: true,
+    })
+    expect(turn.parentSpanContext?.traceState?.serialize()).toBe('vendor=value')
+    expect(turn.attributes['dsh.trace.deterministic_id']).toBe(createDshTurnTraceId(SESSION_ID, 1))
+    expect(turn.attributes['langfuse.trace.metadata.dsh_deterministic_trace_id']).toBe(createDshTurnTraceId(SESSION_ID, 1))
+    expect(spans.get('step 0')!.spanContext().traceId).toBe(traceId)
+    expect(spans.get('step 0')!.parentSpanContext?.spanId).toBe(turn.spanContext().spanId)
+    expect(spans.get('step 0')!.attributes['langfuse.trace.metadata.dsh_deterministic_trace_id'])
+      .toBe(createDshTurnTraceId(SESSION_ID, 1))
+    const secondTurn = spans.get('turn 2')!
+    expect(secondTurn.spanContext().traceId).toBe(secondTraceId)
+    expect(secondTurn.parentSpanContext?.spanId).toBe(secondParentSpanId)
+    expect(secondTurn.attributes['dsh.trace.deterministic_id']).toBe(createDshTurnTraceId(SESSION_ID, 2))
   })
 
   it('clips oversized payloads at the configured attribute budget', () => {

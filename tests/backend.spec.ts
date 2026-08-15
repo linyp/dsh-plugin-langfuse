@@ -5,6 +5,7 @@
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { TraceFlags } from '@opentelemetry/api'
 import type { ReadableSpan } from '@opentelemetry/sdk-trace-base'
 
 const pipelines = vi.hoisted(() => [] as unknown[])
@@ -39,6 +40,7 @@ import { recordFeedback } from '@deepseek-ai/dsh-command-feedback'
 import {
   LangfuseSessionTelemetryBackend,
   LangfuseTelemetryMode,
+  createDshTurnTraceId,
 } from '../src/index.ts'
 
 interface CapturedPipeline {
@@ -89,17 +91,18 @@ async function mount(mode: LangfuseTelemetryMode): Promise<{
   return { ctx, session: ctx.sessions.create(SessionId('feedback-replay')), pipeline }
 }
 
-/** Stable tree shape independent of random OTel trace/span identifiers. */
+/** Stable tree shape including the now-deterministic OTel Trace ID. */
 function normalize(spans: ReadableSpan[]): unknown[] {
   const namesBySpanId = new Map(spans.map(span => [span.spanContext().spanId, span.name]))
   return spans.map(span => ({
     name: span.name,
+    traceId: span.spanContext().traceId,
     parent: span.parentSpanContext === undefined ? undefined : namesBySpanId.get(span.parentSpanContext.spanId),
     attributes: span.attributes,
   })).sort((a, b) => a.name.localeCompare(b.name))
 }
 
-describe('LangfuseSessionTelemetryBackend FEEDBACK_ONLY', () => {
+describe('LangfuseSessionTelemetryBackend', () => {
   it('replays only a canonical feedback-gated prefix through the same tree projection as FULL', async () => {
     const full = await mount(LangfuseTelemetryMode.FULL)
     appendTurn(full.session)
@@ -140,6 +143,8 @@ describe('LangfuseSessionTelemetryBackend FEEDBACK_ONLY', () => {
 
     recordFeedback(gated.session, 'release this prefix')
     expect(normalize(gated.pipeline.exporter.getFinishedSpans())).toEqual(expected)
+    expect(gated.pipeline.exporter.getFinishedSpans().find(span => span.name === 'turn 1')?.spanContext().traceId)
+      .toBe(createDshTurnTraceId('feedback-replay', 1))
 
     // A later feedback with no new trace-producing events advances the
     // canonical cursor but must not replay the already released tree.
@@ -157,8 +162,43 @@ describe('LangfuseSessionTelemetryBackend FEEDBACK_ONLY', () => {
     expect(afterSecondPrefix).toHaveLength(firstCaptureCount + 1)
     expect(afterSecondPrefix.filter(span => span.name === 'turn 1')).toHaveLength(1)
     expect(afterSecondPrefix.filter(span => span.name === 'turn 2')).toHaveLength(1)
+    expect(afterSecondPrefix.find(span => span.name === 'turn 2')?.spanContext().traceId)
+      .toBe(createDshTurnTraceId('feedback-replay', 2))
 
     await gated.ctx.fiber.dispose()
     await full.ctx.fiber.dispose()
+  })
+
+  it('carries a per-turn W3C parent through the real telemetry waterfall', async () => {
+    const mounted = await mount(LangfuseTelemetryMode.FULL)
+    const traceId = '4bf92f3577b34da6a3ce929d0e0e4736'
+    const parentSpanId = '00f067aa0ba902b7'
+    mounted.ctx.on('session-telemetry/record', (record, next) => {
+      const outbound = next()
+      if (outbound.attributes['event.type'] !== 'turn/start') return outbound
+      return {
+        ...outbound,
+        attributes: {
+          ...outbound.attributes,
+          traceparent: `00-${traceId}-${parentSpanId}-01`,
+          tracestate: 'host=runtime',
+        },
+      }
+    })
+
+    appendTurn(mounted.session)
+    const turn = mounted.pipeline.exporter.getFinishedSpans().find(span => span.name === 'turn 1')!
+    expect(turn.spanContext().traceId).toBe(traceId)
+    expect(turn.parentSpanContext).toMatchObject({
+      traceId,
+      spanId: parentSpanId,
+      traceFlags: TraceFlags.SAMPLED,
+      isRemote: true,
+    })
+    expect(turn.parentSpanContext?.traceState?.serialize()).toBe('host=runtime')
+    expect(turn.attributes['dsh.trace.deterministic_id'])
+      .toBe(createDshTurnTraceId('feedback-replay', 1))
+
+    await mounted.ctx.fiber.dispose()
   })
 })

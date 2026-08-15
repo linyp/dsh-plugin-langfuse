@@ -27,10 +27,12 @@ import {
 import { APP_IDENTITY } from '@deepseek-ai/dsh-llm'
 import type { OTLPExporterNodeConfigBase } from '@opentelemetry/otlp-exporter-base'
 import type { BufferConfig } from '@opentelemetry/sdk-trace-base'
+import { TelemetryIdentityRegistry } from './identity-registry.ts'
 import { buildBasicAuthHeader, buildTracerPipeline, type TracerPipeline } from './otel.ts'
 import { DEFAULT_MAX_ATTRIBUTE_CHARS, SessionSpanFolder, type CorrelationConfig } from './projection.ts'
 
 export { DEFAULT_MAX_ATTRIBUTE_CHARS, type CorrelationConfig }
+export { createDshTurnTraceId, TRACEPARENT_ATTRIBUTE, TRACESTATE_ATTRIBUTE } from './identity.ts'
 
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string }
 
@@ -228,7 +230,14 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
       scopeName: 'dsh-plugin-langfuse',
       scopeVersion: version,
     })
-    const folder = new SessionSpanFolder(this.pipeline.tracer, { maxAttributeChars, correlation })
+    const identityRegistry = new TelemetryIdentityRegistry({
+      onWarning: message => ctx.logger.warn(message),
+    })
+    const folder = new SessionSpanFolder(this.pipeline.tracer, {
+      maxAttributeChars,
+      correlation,
+      identityRegistry,
+    })
     this.folder = folder
     const enqueue: SessionTelemetrySink['emit'] = (record: SessionTelemetryRecord) => folder.fold(record)
     const backend: SessionTelemetrySink = {
