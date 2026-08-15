@@ -2,7 +2,7 @@
 
 [English](README.md) | 中文
 
-为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）提供 [Langfuse](https://langfuse.com) 可观测性：把每个 agent 会话导出为 OpenTelemetry trace 树 —— turn → trace、模型 step → generation、工具调用 → tool span，附带 GenAI 语义约定和 `langfuse.*` 属性 —— 发送到 Langfuse 的 OTLP 端点。
+为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（`dsh`）提供 [Langfuse](https://langfuse.com) 可观测性：把每个 turn 导出为 OpenTelemetry trace（模型 step → generation、工具调用 → tool span），按 session 分组，把 canonical feedback 记录成 Langfuse Score，并保留 fork/subagent 血缘。
 
 这是一个社区插件（`dsh-plugin` topic），不属于官方仓库。它实现 harness 的公开 telemetry seam（`@deepseek-ai/dsh-session-telemetry`），作为官方 OTLP-logs 导出器之外的另一个后端。
 
@@ -22,7 +22,7 @@ export LANGFUSE_HOST=https://us.cloud.langfuse.com
 dsh web                        # 即 dsh --profile web 的别名
 ```
 
-附带的 patch 会禁用 base profile 的 `session-telemetry-otel` 行（telemetry seam 每个 context 只接受一个后端；重复加载会抛错），并在存在 Langfuse key 时以 `FULL` 模式挂载本后端，否则为 `DISABLED`。设置 `LANGFUSE_TELEMETRY_MODE=FEEDBACK_ONLY` 可将共享收窄为反馈门控释放。
+附带的 patch 会禁用 base profile 的 `session-telemetry-otel` 行（telemetry seam 每个 context 只接受一个后端；重复加载会抛错），并在存在 Langfuse key 时以 `FULL` 模式挂载本后端，否则为 `DISABLED`。两个项目密钥都存在时，它还会启用 feedback Score。设置 `LANGFUSE_TELEMETRY_MODE=FEEDBACK_ONLY` 可将共享收窄为反馈门控释放。
 
 bundle 层和环境变量都在启动时读取：安装后必须重启已在运行的实例，且启动 shell 里要带上这些变量。`dsh --profile web --dump-config` 可以不启动就查看组合结果 —— 应出现一个 `# == dsh-plugin-langfuse` 层，它 patch 掉 base 的 telemetry 行并新增 env 驱动模式的 `session-telemetry-langfuse` 行。跑完下一轮对话后，trace 出现在 **`LANGFUSE_HOST` 所指区域**的 Langfuse 控制台 —— 密钥按区域隔离，US 区项目在 EU 控制台上什么都看不到。`dsh plugin --profile web remove dsh-plugin-langfuse` 会同时移除依赖和对应的层。
 
@@ -38,6 +38,11 @@ bundle 层和环境变量都在启动时读取：安装后必须重启已在运�
     auth:
       publicKey: !!js process.env.LANGFUSE_PUBLIC_KEY
       secretKey: !!js process.env.LANGFUSE_SECRET_KEY
+    feedbackScores:             # 可选；显式配置时默认关闭
+      enabled: true
+      url: https://cloud.langfuse.com/api/public/scores
+      maxQueueSize: 256
+      requestTimeoutMillis: 3000
     processor: {}              # 可选；原样透传给 BatchSpanProcessor
     shutdownTimeoutMillis: 3000
 ```
@@ -50,11 +55,12 @@ bundle 层和环境变量都在启动时读取：安装后必须重启已在运�
 | `exporter` | 完整的 `OTLPExporterNodeConfigBase` 对象，传给 OTLP/HTTP trace exporter。非 `DISABLED` 模式下 `url` 必填，且必须是**完整的 traces 路径**（`…/api/public/otel/v1/traces`）。插件默认附带 `x-langfuse-ingestion-version: 4` 请求头——缺少它新 span 不会实时进入 Langfuse 的 v4 数据模型。无论显式条目来自普通 `exporter.headers` 对象还是 `HeadersFactory` 的返回值，均按任意大小写识别并优先采用。 |
 | `auth` | Langfuse 项目密钥对，转换为端点的 Basic-auth 请求头。与显式的 `exporter.headers` authorization 互斥；上传模式要求两者恰好提供其一。 |
 | `correlation` | 宿主身份关联：`userId`/`sessionId` 以 `langfuse.user.id`/`langfuse.session.id` 盖在每个导出 span 上，让嵌入方宿主的 trace 和本插件的 trace 归入同一个 Langfuse user/session。见[与嵌入宿主关联](#与嵌入宿主关联)。 |
+| `feedbackScores` | 可选：把 canonical `feedback/record` 导出为 session-level TEXT Score。`enabled` 默认 `false`；`url` 必须是完整的 `…/api/public/scores` 路径。`maxQueueSize` 默认 256，`requestTimeoutMillis` 默认 3000。有界内存队列与 trace 故障隔离，并在 shutdown 时 best-effort 排空。bundle profile 在两个项目密钥都存在时启用它。 |
 | `processor` | 原样透传给 `BatchSpanProcessor`（`scheduledDelayMillis`、`maxQueueSize`、`maxExportBatchSize` 等）；批处理、重试、丢失策略均为 SDK 的文档化行为。 |
 | `maxAttributeChars` | 每个 span 属性的序列化 payload 上限（默认 32768）；超长部分以 `…[clipped]` 标记裁剪，canonical 会话日志保留完整字节。 |
 | `shutdownTimeoutMillis` | 插件持有的 SDK shutdown 排水外层截止时间（默认 3000）。 |
 
-错误配置在插件加载时即失败：`url` 缺失/畸形/非 http(s)、凭据缺失、双重鉴权歧义、非正的 `maxExportBatchSize`（SDK 会在 shutdown 时挂死）、非法的 `correlation` 结构或空的 `correlation.userId`/`sessionId`、未知 `mode`，全部在构造任何传输之前抛出。
+错误配置在插件加载时即失败：exporter URL 缺失/畸形/非 http(s)、凭据缺失、双重鉴权歧义、非正的 `maxExportBatchSize`（SDK 会在 shutdown 时挂死）、非法的 `correlation` 结构或空的 `correlation.userId`/`sessionId`、启用 Score 却没有合法 URL/队列/超时、未知 `mode`，全部在构造任何传输之前抛出。
 
 ## 与嵌入宿主关联
 
@@ -72,7 +78,7 @@ config:
 - **按轮动态覆盖**：`turn/start` record 上携带的 `langfuse.user.id`/`langfuse.session.id` 属性覆盖该轮的静态配置——部署方通过 `session-telemetry/record` waterfall listener 注入。快照在 `turn/start` 时锁定；之后 record 上的身份属性一律忽略。优先级：record 属性 > `correlation` 配置 > dsh session id。
 - 动态映射必须可从 dsh session id 确定性重建，且至少存活到该会话不再可能触发 `FEEDBACK_ONLY` 重放为止——否则重放出的树会带上与实时捕获不同的身份。
 - 静态 `correlation` 值不经过脱敏 waterfall：waterfall 只变换 record，而这些值从不途经 record。
-- 投递语义不变：correlation 是身份而非去重——重复仍然可能（见决策 4）。
+- 投递语义不变：correlation 是身份而非去重——重复仍然可能（见决策 5）。
 
 ## Langfuse 中会看到什么
 
@@ -84,6 +90,8 @@ config:
 | step 的首个 `assistant/chunk` | `langfuse.observation.completion_start_time`（首 token 时间） |
 | `tool/call` + `tool/result` | tool span（参数为 input，结果为 output，`isError` → 状态 ERROR） |
 | `user/message` | 根 observation input；同时保留已弃用的 trace input，以兼容旧版 evaluator |
+| `feedback/record` | `feedbackScores.enabled` 时成为 session-level `dsh_user_feedback` TEXT Score；只有 canonical 且经过 waterfall 的文本有资格发送 |
+| fork child session | 独立的 child turn trace，并带可查询的 parent/seed metadata；进程内仍保留父 turn context 时附加指向它的 OTel Link |
 | `agent-error` ops 记录 | 开放 turn 上的 `agent-error` span event + 状态 ERROR |
 | 其他所有事件类型（todo、plan、compaction、hooks、插件事件） | 开放 turn 上的时间点 span event |
 
@@ -106,7 +114,7 @@ Harness 的规则是 **model-visible ⟺ logged**：所有进入模型请求的�
 
 官方 `session-telemetry-otel` 后端喂不了 Langfuse：它导出 OTLP **logs**，而 Langfuse 的 OTLP 端点（`/api/public/otel`）**只接受 traces**，走 OTLP/HTTP（JSON 或 protobuf；不支持 gRPC），Basic 鉴权。这个不匹配——而不是缺一个 URL——正是本插件存在的原因。
 
-导出管线是原生 OTel traces SDK（`BasicTracerProvider` → `BatchSpanProcessor` → `OTLPTraceExporter`），与官方后端同一 SDK 家族、同一配置面；属性遵循 OTel GenAI 语义约定加 Langfuse 文档化的 `langfuse.*` 属性映射。Langfuse v5 SDK（`@langfuse/otel`、`@langfuse/client`）经评估后延后采用：它本身也基于 OTel，引入 vendor 依赖却不改变 wire 格式；而真正需要它的功能（`feedback/record` → score、prompt 管理）属于延后工作。将来采用它只是本包内部的变更。
+Trace 管线使用原生 OTel traces SDK（`BasicTracerProvider` → `BatchSpanProcessor` → `OTLPTraceExporter`），与官方后端同一 SDK 家族、同一配置面；属性遵循 OTel GenAI 语义约定加 Langfuse 文档化的 `langfuse.*` 属性映射。Feedback Score 使用小型原生 HTTP transport，而不再初始化第二套 tracing SDK，因此可以复用异步/自定义鉴权合约，并隔离 trace 与 Score 的故障。将来可在不改变 telemetry seam 或公开配置的前提下，把该内部 transport 换成 Langfuse SDK。
 
 ### 3. 折叠投影 —— 因为 seam 交来扁平流，而 Langfuse 需要树
 
@@ -120,11 +128,17 @@ seam 的记录与会话日志事件一一对应；Langfuse 需要 trace → obse
 - **未知事件类型落为开放 turn 上的 span event** —— 事件词汇表是 merge-extensible 的，丢弃未知类型会悄悄稀释时间线。
 - **强制收尾扫描**在三处关闭仍开放的 span（标记 `dsh.force_ended`）：新 `turn/start` 到来而前一个 turn 未闭合、会话的 ops `shutdown` 记录、后端 shutdown —— teardown 绝不把已开始的 span 遗弃在 SDK 队列里。
 
-### 4. 投递语义：at-most-once handoff，可能重复
+### 4. 稳定身份、feedback Score 与 fork 血缘
+
+- 对 `(dsh session id, turn)` 做带版本的 SHA-256 派生，使实时导出与 `FEEDBACK_ONLY` 重放得到相同的 32 位十六进制 Trace ID。合法的逐 turn W3C `traceparent` 仍优先用于分布式追踪；确定性 ID 保留为可查询 metadata。
+- Canonical feedback 经有界单 worker 队列成为 session-level `dsh_user_feedback` TEXT Score。它使用确定性 Score ID，以同一个 ID 重试瞬时失败，且永不阻塞或破坏 agent loop。源事件没有 rating 或目标 turn，因此 0.2.x 不推测这些语义。
+- 每个 child turn 都带直接父 session、seed boundary 和可解析的父 Trace ID metadata。若有界进程内 registry 仍保存已完成父 turn 的根 SpanContext，child root 还会携带一个 OTel Link。父 context 缺失、淘汰或跨进程时降级为 metadata 和 `dsh.lineage.linked=false`，绝不伪造 context。
+
+### 5. 投递语义：at-most-once handoff，可能重复
 
 继承自 seam：cursor 标记的是*已交接*而非已送达；崩溃时留在 SDK 批处理队列里的数据会丢失；无 cursor 的重新收养（热重载）可能重发前缀，产生重复 span。接收端以 `langfuse.session.id` + `dsh.turn` + `dsh.event.seq` 关联。持久化 outbox 有意不做，与 seam 自身的立场一致。
 
-### 5. 什么数据离开本机
+### 6. 什么数据离开本机
 
 上传模式下，span 属性携带用户与助手消息内容、工具参数与结果、模型/用量元数据，以 `session-telemetry/record` waterfall 的返回值为准。**本插件不带任何脱敏规则**；导出跨越信任边界的部署需自行挂载 waterfall listener。Provider API key 结构性缺席（它们是构造参数，从不是会话事件）。序列化 payload 每属性按 `maxAttributeChars` 裁剪（默认 32768）；canonical 日志保留完整字节。
 
@@ -143,11 +157,12 @@ npm test                       # 单元：折叠投影 + 配置 fail-loud 路径
 npm run build && npm run test:e2e   # REAL composition：经 Loader 启动真实 dsh 应用
                                # （mock 模型 + 真实 bash 往返），断言 mock Langfuse
                                # collector 在 wire 上实际收到的 OTLP payload
+npm run test:package           # npm pack + 空 consumer 安装/import + bundle 组合
 ```
 
 e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`）：fixture `cordis.yml` 加载**构建产物** `lib/index.js` —— 与部署加载的是同一个文件 —— 断言针对 wire，而非内部实现。
 
-存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output 与逐 observation 的 user/session 关联；未提供密钥时该测试自行跳过。
+存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata，并通过 Scores API 回读 feedback；未提供密钥时该测试自行跳过。
 
 ## 版本兼容
 
@@ -156,12 +171,13 @@ DeepSeek Harness 处于 developer preview，无兼容承诺；本插件精确锁
 | dsh-plugin-langfuse | @deepseek-ai/dsh-* |
 |---|---|
 | 0.1.x | 0.1.0-rc.6 |
+| 0.2.x | 0.1.0-rc.6 |
 
 ## 已知限制与延后工作
 
-- **`feedback/record` → Langfuse score** 延后；需要 `@langfuse/client` 或 public ingestion API（决策 2）。
-- **Subagent 血缘未拼接**：fork 出的会话其 trace 树从继承边界开始；`session.parent_id`/`seed_length` 随属性携带，但尚未创建 trace link。
-- **无持久化投递**（决策 4）。
+- **Feedback 仅为 TEXT/session-level**：当前 DSH 事件不带数值 rating 或目标 turn/observation，因此插件不会自行推测。
+- **不保证 UI 渲染 OTel Link**：parent/seed metadata 是稳定且可通过 API 查询的 lineage 合约；Langfuse 未必把 Link 显示成可点击边。
+- **无持久化投递**（决策 5）：OTel batch 与 Score 队列都在内存中，进程崩溃可能丢失已接收但未 flush 的数据。
 - **每个 context 只能有一个后端**：同时运行 Langfuse 和官方 OTLP-logs 后端需要上游 seam 演进出 multi-sink。
 
 ## 许可证

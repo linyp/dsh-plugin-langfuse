@@ -2,7 +2,7 @@
 
 English | [中文](README.zh.md)
 
-[Langfuse](https://langfuse.com) observability for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`): exports each agent session as an OpenTelemetry trace tree — turn → trace, model step → generation, tool call → tool span, with GenAI semantic-convention and `langfuse.*` attributes — to Langfuse's OTLP endpoint.
+[Langfuse](https://langfuse.com) observability for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`): exports each turn as an OpenTelemetry trace — model step → generation, tool call → tool span — groups turns by session, records canonical feedback as Langfuse Scores, and preserves fork/subagent lineage.
 
 This is a community plugin (`dsh-plugin` topic), not part of the official repository. It implements the harness's public telemetry seam (`@deepseek-ai/dsh-session-telemetry`) as an alternative backend to the official OTLP-logs exporter.
 
@@ -22,7 +22,7 @@ export LANGFUSE_HOST=https://us.cloud.langfuse.com
 dsh web                        # alias for: dsh --profile web
 ```
 
-The bundled patch disables the base profile's `session-telemetry-otel` row (the telemetry seam accepts exactly one backend per context; a duplicate load throws) and mounts this backend in `FULL` mode when a Langfuse key is present, `DISABLED` otherwise. `LANGFUSE_TELEMETRY_MODE=FEEDBACK_ONLY` narrows sharing to feedback-gated release.
+The bundled patch disables the base profile's `session-telemetry-otel` row (the telemetry seam accepts exactly one backend per context; a duplicate load throws) and mounts this backend in `FULL` mode when a Langfuse key is present, `DISABLED` otherwise. It also enables feedback Scores when both project keys are present. `LANGFUSE_TELEMETRY_MODE=FEEDBACK_ONLY` narrows sharing to feedback-gated release.
 
 Both the bundle layer and the env vars are read at boot: an already-running instance must be restarted after installing, from a shell that has the variables set. `dsh --profile web --dump-config` shows the composed result without booting — a `# == dsh-plugin-langfuse` layer that patches the base telemetry row and adds `session-telemetry-langfuse` with its env-driven mode. After the next turn, traces appear in the Langfuse console **of the region `LANGFUSE_HOST` points at** — keys are region-scoped, so a US project shows nothing on the EU console. `dsh plugin --profile web remove dsh-plugin-langfuse` removes both the dependency and the layer.
 
@@ -38,6 +38,11 @@ Or as an explicit `cordis.yml` row:
     auth:
       publicKey: !!js process.env.LANGFUSE_PUBLIC_KEY
       secretKey: !!js process.env.LANGFUSE_SECRET_KEY
+    feedbackScores:             # optional; disabled by default for explicit rows
+      enabled: true
+      url: https://cloud.langfuse.com/api/public/scores
+      maxQueueSize: 256
+      requestTimeoutMillis: 3000
     processor: {}              # optional; passed verbatim to BatchSpanProcessor
     shutdownTimeoutMillis: 3000
 ```
@@ -50,11 +55,12 @@ Or as an explicit `cordis.yml` row:
 | `exporter` | The complete `OTLPExporterNodeConfigBase` object, passed to the OTLP/HTTP trace exporter. `url` is required outside `DISABLED` and must be the **full traces path** (`…/api/public/otel/v1/traces`). The plugin defaults an `x-langfuse-ingestion-version: 4` header — without it new spans do not land on Langfuse's v4 data model in real time. An explicit entry (any casing) wins, whether supplied in a plain `exporter.headers` object or returned by a `HeadersFactory`. |
 | `auth` | Langfuse project key pair, turned into the endpoint's Basic-auth header. Mutually exclusive with an explicit `exporter.headers` authorization; uploading modes require exactly one of the two. |
 | `correlation` | Host-identity correlation: `userId`/`sessionId` stamped as `langfuse.user.id`/`langfuse.session.id` on every exported span so an embedding host's traces and this plugin's group under one Langfuse user/session. See [Correlating with an embedding host](#correlating-with-an-embedding-host). |
+| `feedbackScores` | Optional session-level TEXT Score export for canonical `feedback/record` events. `enabled` defaults to `false`; `url` must be the full `…/api/public/scores` path. `maxQueueSize` defaults to 256 and `requestTimeoutMillis` to 3000. The bounded in-memory queue is failure-isolated from tracing and drains best-effort on shutdown. The bundled profile enables it when both project keys exist. |
 | `processor` | Passed verbatim to `BatchSpanProcessor` (`scheduledDelayMillis`, `maxQueueSize`, `maxExportBatchSize`, …); batching, retry, and loss policy are the SDK's documented behavior. |
 | `maxAttributeChars` | Serialized-payload ceiling per span attribute (default 32768); longer payloads are clipped with an `…[clipped]` marker while the canonical session log keeps the full bytes. |
 | `shutdownTimeoutMillis` | Plugin-owned outer deadline on the SDK's shutdown drain (default 3000). |
 
-Misconfiguration fails loud at plugin load: a missing/malformed/non-http(s) `url`, missing credentials, ambiguous double auth, a non-positive `maxExportBatchSize` (the SDK would hang on shutdown), an invalid `correlation` shape or empty `correlation.userId`/`sessionId`, or an unknown `mode` all throw before any transport is constructed.
+Misconfiguration fails loud at plugin load: a missing/malformed/non-http(s) exporter URL, missing credentials, ambiguous double auth, a non-positive `maxExportBatchSize` (the SDK would hang on shutdown), an invalid `correlation` shape or empty `correlation.userId`/`sessionId`, an enabled Score sink without a valid URL/queue/timeout, or an unknown `mode` all throw before any transport is constructed.
 
 ## Correlating with an embedding host
 
@@ -72,7 +78,7 @@ config:
 - **Per-turn dynamic override**: a `turn/start` record carrying `langfuse.user.id`/`langfuse.session.id` attributes overrides the static config for that turn — a deployment injects them through a `session-telemetry/record` waterfall listener. The snapshot is locked at `turn/start`; identity attributes on later records are ignored. Precedence: record attributes > `correlation` config > dsh session id.
 - A dynamic mapping must be deterministic and rebuildable from the dsh session id, and must survive for as long as the session can still trigger a `FEEDBACK_ONLY` replay — otherwise the replayed tree exports under a different identity than live capture would have.
 - Static `correlation` values bypass the redaction waterfall: the waterfall transforms records, and these values never transit one.
-- Delivery semantics are unchanged: correlation is identity, not dedup — duplicates remain possible (see decision 4).
+- Delivery semantics are unchanged: correlation is identity, not dedup — duplicates remain possible (see decision 5).
 
 ## What appears in Langfuse
 
@@ -84,6 +90,8 @@ config:
 | first `assistant/chunk` of a step | `langfuse.observation.completion_start_time` (time-to-first-token) |
 | `tool/call` + `tool/result` | tool span (arguments as input, result as output, `isError` → status ERROR) |
 | `user/message` | root observation input; deprecated trace input is retained for legacy evaluator compatibility |
+| `feedback/record` | session-level `dsh_user_feedback` TEXT Score when `feedbackScores.enabled`; only the post-waterfall canonical text is eligible |
+| forked child session | independent child turn trace plus queryable parent/seed metadata; an OTel Link points to the completed parent turn when its in-process context is retained |
 | `agent-error` ops record | `agent-error` span event + status ERROR on the open turn |
 | every other event type (todo, plan, compaction, hooks, plugin events) | point-in-time span event on the open turn |
 
@@ -106,7 +114,7 @@ Instrumenting the LLM adapter or agent loop directly would duplicate all of that
 
 The official `session-telemetry-otel` backend cannot feed Langfuse: it exports OTLP **logs**, and Langfuse's OTLP endpoint (`/api/public/otel`) accepts **traces only**, over OTLP/HTTP (JSON or protobuf; no gRPC), with Basic auth. That mismatch — not a missing URL — is why this plugin exists.
 
-The export pipeline is the plain OTel traces SDK (`BasicTracerProvider` → `BatchSpanProcessor` → `OTLPTraceExporter`), the same SDK family and configuration surface as the official backend, with attributes following the OTel GenAI semantic conventions plus Langfuse's documented `langfuse.*` property mapping. The Langfuse v5 SDK (`@langfuse/otel`, `@langfuse/client`) was considered and deferred: it is itself OTel-based, so it adds a vendor dependency without changing the wire format, and the features that would justify it (scores from `feedback/record`, prompt management) are deferred work. Adopting it later is a change inside this package only.
+The trace pipeline is the plain OTel traces SDK (`BasicTracerProvider` → `BatchSpanProcessor` → `OTLPTraceExporter`), the same SDK family and configuration surface as the official backend, with attributes following the OTel GenAI semantic conventions plus Langfuse's documented `langfuse.*` property mapping. Feedback Scores use a small native-HTTP transport instead of a second tracing SDK so the plugin can reuse its async/custom auth contract and keep trace versus Score failures isolated. The Langfuse SDK can replace that internal transport later without changing the telemetry seam or public configuration.
 
 ### 3. A folding projection, because the seam hands over a flat stream and Langfuse needs a tree
 
@@ -120,11 +128,17 @@ The seam's records mirror session-log events one-to-one; Langfuse needs trace �
 - **Unknown event types land as span events on the open turn** — the event vocabulary is merge-extensible, and dropping unknown types would silently thin the timeline.
 - **Force-end sweeps** close still-open spans (marked `dsh.force_ended`) on a next `turn/start` with an open predecessor, on the session's ops `shutdown` record, and on backend shutdown — teardown never abandons started spans inside the SDK queue.
 
-### 4. Delivery semantics: at-most-once handoff, duplicates possible
+### 4. Stable identity, feedback Scores, and fork lineage
+
+- A versioned SHA-256 identity derived from `(dsh session id, turn)` supplies a stable 32-hex Trace ID across live export and `FEEDBACK_ONLY` replay. A valid per-turn W3C `traceparent` still wins for distributed tracing; the deterministic ID remains queryable metadata.
+- Canonical feedback becomes a session-level `dsh_user_feedback` TEXT Score through a bounded single-worker queue. It uses a deterministic Score ID, retries transient failures with the same ID, and never blocks or fails the agent loop. Because the source event has no rating or target turn, 0.2.x deliberately does not invent one.
+- Every child turn carries direct parent session, seed boundary, and resolved parent Trace ID metadata. If the completed parent root SpanContext remains in the bounded in-process registry, the child root also contains one OTel Link. Missing/evicted/cross-process parents degrade to metadata with `dsh.lineage.linked=false`; no context is fabricated.
+
+### 5. Delivery semantics: at-most-once handoff, duplicates possible
 
 Inherited from the seam: the cursor marks *handed off*, not delivered; whatever sits in the SDK batch queue at crash time is lost, and a cursor-less re-adoption (hot reload) may re-hand a prefix, producing duplicate spans. Receivers correlate on `langfuse.session.id` + `dsh.turn` + `dsh.event.seq`. A durable outbox is deliberately out of scope, matching the seam's own stance.
 
-### 5. What leaves the machine
+### 6. What leaves the machine
 
 In uploading modes, span attributes carry user and assistant message content, tool arguments and results, and model/usage metadata, as returned by the `session-telemetry/record` waterfall. **This plugin ships no redaction rules**; a deployment exporting beyond a trusted boundary mounts its own waterfall listener. Provider API keys are structurally absent (they are constructor parameters, never session events). Serialized payloads are clipped at `maxAttributeChars` per attribute (default 32768); the canonical log keeps the full bytes.
 
@@ -143,11 +157,12 @@ npm test                       # unit: folding projection + config fail-loud pat
 npm run build && npm run test:e2e   # REAL composition: boots a real dsh app via the
                                # Loader (mock model, real bash round trip) and asserts
                                # the OTLP payload a mock Langfuse collector received
+npm run test:package           # npm pack + empty-consumer install/import + bundle composition
 ```
 
 The e2e follows the official repository's REAL-composition pattern (`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`): the fixture `cordis.yml` loads the **built** `lib/index.js` — the same file a deployment loads — and assertions run against the wire, not against internals.
 
-When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output and per-observation user/session correlation. Without keys, that test self-skips.
+When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output, usage, per-observation correlation, parent/child metadata, and the Scores API for feedback readback. Without keys, that test self-skips.
 
 ## Version compatibility
 
@@ -156,12 +171,13 @@ DeepSeek Harness is in developer preview with no compatibility promises; this pl
 | dsh-plugin-langfuse | @deepseek-ai/dsh-* |
 |---|---|
 | 0.1.x | 0.1.0-rc.6 |
+| 0.2.x | 0.1.0-rc.6 |
 
 ## Known limitations and deferred work
 
-- **`feedback/record` → Langfuse score** is deferred; it needs `@langfuse/client` or the public ingestion API (decision 2).
-- **Subagent lineage** is not stitched: a forked session's trace tree starts at its inherited boundary; `session.parent_id`/`seed_length` ride the resource attributes but no trace links are created yet.
-- **No durable delivery** (decision 4).
+- **Feedback is TEXT/session-level only**: the current DSH event carries no numeric rating or target turn/observation, so the plugin does not infer one.
+- **OTel Link UI rendering is not guaranteed**: parent/seed metadata is the stable, API-queryable lineage contract; Langfuse may not render the Link as a clickable edge.
+- **No durable delivery** (decision 5): OTel batching and the Score queue are in memory, so a process crash can lose accepted-but-unflushed data.
 - **One backend per context**: running Langfuse *and* the official OTLP-logs backend simultaneously requires a multi-sink evolution of the upstream seam.
 
 ## License

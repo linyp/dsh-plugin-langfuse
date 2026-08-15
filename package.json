@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-langfuse",
-  "version": "0.1.2",
-  "description": "Langfuse observability for DeepSeek Harness: exports session logs as OpenTelemetry traces (GenAI semantic conventions) to Langfuse's OTLP endpoint",
+  "version": "0.2.0",
+  "description": "Langfuse observability for DeepSeek Harness: OpenTelemetry traces, feedback Scores, and fork lineage",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -47,9 +47,11 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "test:e2e": "vitest run --config vitest.e2e.config.ts"
+    "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:package": "node .github/scripts/test-package.mjs"
   },
   "dependencies": {
     "@deepseek-ai/dsh-command-feedback": "0.1.0-rc.6",

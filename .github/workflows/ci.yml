@@ -21,6 +21,8 @@ jobs:
       - run: npm test
       - run: npm run build
       - run: npm run test:e2e
+      - if: matrix.node == 24
+        run: npm run test:package
 
   # Early warning against upstream churn: dsh is in developer preview with no
   # compatibility promise, so rehearse against the newest published versions.
