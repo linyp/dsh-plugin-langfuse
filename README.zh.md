@@ -175,7 +175,7 @@ DeepSeek Harness 处于 developer preview，无兼容承诺；本插件精确锁
 |---|---|
 | 0.1.x | 0.1.0-rc.6 |
 | 0.2.x | 0.1.0-rc.6 |
-| 0.3.x | 0.1.0-rc.6 |
+| 0.3.x | 0.1.0-rc.7 |
 
 独立的 **Upstream compatibility canary** 工作流会把所有 `@deepseek-ai/*` 依赖解析到最新发布版本。Pull request 与 `main` push 只做预警；每周定时和手动触发严格失败，并依次运行 typecheck、单测、构建、REAL-composition e2e 与 package smoke。失败运行会保留解析后的 manifest 和 lockfile，便于复现。
 

@@ -175,7 +175,7 @@ DeepSeek Harness is in developer preview with no compatibility promises; this pl
 |---|---|
 | 0.1.x | 0.1.0-rc.6 |
 | 0.2.x | 0.1.0-rc.6 |
-| 0.3.x | 0.1.0-rc.6 |
+| 0.3.x | 0.1.0-rc.7 |
 
 The separate **Upstream compatibility canary** workflow resolves every `@deepseek-ai/*` dependency to its newest published version. Pull requests and `main` pushes are advisory; the weekly schedule and manual dispatch are strict and run typecheck, unit tests, build, REAL-composition e2e, and package smoke. Failed runs retain the resolved manifest and lockfile for reproduction.
 
