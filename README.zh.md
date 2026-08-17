@@ -165,7 +165,7 @@ npm run test:package           # npm pack + 空 consumer 安装/import + bundle 
 
 e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`）：fixture `cordis.yml` 加载**构建产物** `lib/index.js` —— 与部署加载的是同一个文件 —— 断言针对 wire（包括独立 compaction trace），而非内部实现。
 
-存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata，并通过 Scores API 回读 feedback；未提供密钥时该测试自行跳过。
+存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata、独立 compaction 的身份/摘要/usage，并通过 Scores API 回读 feedback；未提供密钥时该测试自行跳过。
 
 ## 版本兼容
 

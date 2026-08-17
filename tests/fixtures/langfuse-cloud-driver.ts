@@ -25,6 +25,30 @@ try {
   const feedbackText = `dsh-plugin-langfuse cloud e2e ${Date.now()}`
   recordFeedback(sessions[0]!, feedbackText)
   const parent = sessions[0]!
+  const compactionId = `cloud-compaction-${Date.now()}`
+  const compactionSummary = `cloud compaction summary ${compactionId}`
+  // The compaction vocabulary is declaration-merged by its owning plugin.
+  // Keep this fixture dependency-neutral while exercising the exact durable
+  // event bodies that the telemetry seam hands to the built backend.
+  const appendExtensionEvent = parent.append.bind(parent) as unknown as (type: string, data: unknown) => void
+  appendExtensionEvent('compaction/start', { compactionId, turn: null })
+  appendExtensionEvent('compaction/summary', {
+    compactionId,
+    summary: [{ type: 'text', text: compactionSummary }],
+    shadowedRange: { start: 1, end: 3 },
+    shadowedSeqs: [1, 2, 3],
+    shadowedTokenCount: 777,
+    provider: 'langfuse-compaction-mock',
+    model: 'langfuse-compaction-mock',
+    maxTokens: 256,
+    usage: {
+      inputTokens: 13,
+      outputTokens: 5,
+      cacheReadTokens: 2,
+      cacheWriteTokens: 3,
+    },
+  })
+  appendExtensionEvent('compaction/end', { compactionId, turn: null })
   const child = ctx.sessions.fork(parent)
   child.append('turn/start', { turn: 2 })
   child.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
@@ -34,6 +58,8 @@ try {
     parentSessionId: parent.id,
     childSessionId: child.id,
     feedbackText,
+    compactionId,
+    compactionSummary,
   }))
 } finally {
   await ctx.fiber.dispose()

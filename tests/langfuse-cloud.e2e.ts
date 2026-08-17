@@ -13,6 +13,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
+import { SYNTHETIC_PARENT_SPAN_ID, createDshCompactionTraceId } from '../src/identity.ts'
 
 const PUBLIC_KEY = process.env.LANGFUSE_PUBLIC_KEY
 const SECRET_KEY = process.env.LANGFUSE_SECRET_KEY
@@ -69,6 +70,8 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     let parentSessionId = ''
     let childSessionId = ''
     let feedbackText = ''
+    let compactionId = ''
+    let compactionSummary = ''
     await runLoaderSmoke({
       label: 'dsh-plugin-langfuse-cloud',
       tempDirPrefix: 'dsh-plugin-langfuse-cloud-',
@@ -83,11 +86,15 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
           parentSessionId: string
           childSessionId: string
           feedbackText: string
+          compactionId: string
+          compactionSummary: string
         }
         sessionIds = output.sessionIds
         parentSessionId = output.parentSessionId
         childSessionId = output.childSessionId
         feedbackText = output.feedbackText
+        compactionId = output.compactionId
+        compactionSummary = output.compactionSummary
       },
     })
     expect(sessionIds.length).toBeGreaterThan(0)
@@ -107,10 +114,18 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
       const page = await api<{ data?: V2Observation[] }>(`/api/public/v2/observations?${params}`)
       rows = (page.data ?? []).filter(row => row.sessionId !== undefined && sessionIds.includes(row.sessionId))
       const generations = rows.filter(row => row.type === 'GENERATION')
-      const root = rows.find(row => row.isRootObservation === true && row.sessionId === parentSessionId)
+      const stepGenerations = generations.filter(row => row.name === 'step 1' || row.name === 'step 2')
+      const compaction = generations.find(row => row.name === 'compaction'
+        && row.sessionId === parentSessionId
+        && row.model === 'langfuse-compaction-mock')
+      const root = rows.find(row => row.isRootObservation === true
+        && row.sessionId === parentSessionId
+        && row.name === 'turn 1')
       const childRoot = rows.find(row => row.isRootObservation === true && row.sessionId === childSessionId)
-      const ready = generations.length >= 2
-        && generations.every(row => row.model === 'langfuse-mock' && row.usageDetails !== undefined)
+      const ready = stepGenerations.length >= 2
+        && stepGenerations.every(row => row.model === 'langfuse-mock' && row.usageDetails !== undefined)
+        && compaction?.usageDetails !== undefined
+        && JSON.stringify(compaction.output).includes(compactionSummary)
         && rows.some(row => row.type === 'TOOL' && row.name === 'bash')
         && root?.input != null
         && root.output != null
@@ -124,7 +139,8 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     // Langfuse normalizes canonical inclusive OTel usage back into mutually
     // exclusive buckets: 16 total input = 11 uncached + 2 read + 3 created.
     const generations = rows.filter(row => row.type === 'GENERATION')
-    for (const generation of generations) expect(generation.model).toBe('langfuse-mock')
+    const stepGenerations = generations.filter(row => row.name === 'step 1' || row.name === 'step 2')
+    for (const generation of stepGenerations) expect(generation.model).toBe('langfuse-mock')
     const step1 = generations.find(row => row.name === 'step 1')
     expect(step1?.usageDetails).toMatchObject({
       input: 11,
@@ -147,6 +163,38 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     expect(step2?.outputUsage).toBe(5)
     expect(step2?.totalUsage).toBe(12)
 
+    // Standalone compaction is a first-class root Generation with its stable
+    // deterministic trace identity, summary output, aggregate-only input,
+    // canonical usage normalization, and queryable transaction metadata.
+    const compaction = generations.find(row => row.name === 'compaction'
+      && row.sessionId === parentSessionId
+      && row.model === 'langfuse-compaction-mock')
+    expect(compaction, `no compaction observation among: ${JSON.stringify(rows.map(o => o.name))}`).toBeDefined()
+    expect(compaction).toMatchObject({
+      traceId: createDshCompactionTraceId(parentSessionId, compactionId),
+      sessionId: parentSessionId,
+      userId: 'dsh-plugin-langfuse-e2e',
+      isRootObservation: true,
+      model: 'langfuse-compaction-mock',
+      inputUsage: 18,
+      outputUsage: 5,
+      totalUsage: 23,
+    })
+    // Deterministic OTel Trace IDs are seeded through a valid non-recording
+    // parent. Langfuse preserves that span id while the app-root marker makes
+    // this observation the logical root in its v4 model.
+    expect(compaction?.parentObservationId).toBe(SYNTHETIC_PARENT_SPAN_ID)
+    expect(compaction?.usageDetails).toMatchObject({
+      input: 13,
+      output: 5,
+      input_cached_tokens: 2,
+      input_cache_creation: 3,
+    })
+    expect(JSON.stringify(compaction?.input)).toContain('shadowedTokenCount')
+    expect(JSON.stringify(compaction?.input)).toContain('777')
+    expect(JSON.stringify(compaction?.output)).toContain(compactionSummary)
+    expect(JSON.stringify(compaction?.metadata)).toContain(compactionId)
+
     // The tool observation nests under its requesting generation. Langfuse
     // names tool observations from `gen_ai.tool.name` (`bash`), not the span
     // name (`tool bash`).
@@ -159,7 +207,9 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     // v4 queries filter per observation, so identity must ride every span:
     // each generation/tool row of the observation-first API serves its own
     // session/user fields — the root-span stamp alone is not the contract.
-    const root = rows.find(row => row.isRootObservation === true && row.sessionId === parentSessionId)
+    const root = rows.find(row => row.isRootObservation === true
+      && row.sessionId === parentSessionId
+      && row.name === 'turn 1')
     expect(root, 'v4 root observation').toBeDefined()
     expect(root!.input, 'v4 root observation input').toBeDefined()
     expect(root!.output, 'v4 root observation output').toBeDefined()

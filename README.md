@@ -165,7 +165,7 @@ npm run test:package           # npm pack + empty-consumer install/import + bund
 
 The e2e follows the official repository's REAL-composition pattern (`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`): the fixture `cordis.yml` loads the **built** `lib/index.js` — the same file a deployment loads — and assertions run against the wire, including a standalone compaction trace, not against internals.
 
-When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output, usage, per-observation correlation, parent/child metadata, and the Scores API for feedback readback. Without keys, that test self-skips.
+When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output, usage, per-observation correlation, parent/child metadata, standalone compaction identity/summary/usage, and the Scores API for feedback readback. Without keys, that test self-skips.
 
 ## Version compatibility
 
