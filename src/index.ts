@@ -40,6 +40,8 @@ import {
 
 export { DEFAULT_MAX_ATTRIBUTE_CHARS, type CorrelationConfig }
 export {
+  createCompactionParentContext,
+  createDshCompactionTraceId,
   createDshFeedbackScoreId,
   createDshTurnTraceId,
   TRACEPARENT_ATTRIBUTE,

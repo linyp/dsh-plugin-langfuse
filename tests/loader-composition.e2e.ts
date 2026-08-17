@@ -14,7 +14,11 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { LOADER_SMOKE_TEST_TIMEOUT_MS, runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
-import { SYNTHETIC_PARENT_SPAN_ID, createDshTurnTraceId } from '../src/identity.ts'
+import {
+  SYNTHETIC_PARENT_SPAN_ID,
+  createDshCompactionTraceId,
+  createDshTurnTraceId,
+} from '../src/identity.ts'
 
 const driver = fileURLToPath(new URL('./fixtures/langfuse-driver.ts', import.meta.url))
 const configPath = fileURLToPath(new URL('./fixtures/langfuse.cordis.yml', import.meta.url))
@@ -145,6 +149,16 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         const tool = spans.find(span => span.name === 'tool bash')!
         expect(tool.parentSpanId).toBe(generation.spanId)
         expect(attr(tool, 'langfuse.observation.output')).toBeDefined()
+
+        // A compaction outside an open turn becomes a stable standalone trace
+        // while retaining the same Langfuse correlation identity.
+        const compaction = spans.find(span => span.name === 'compaction')!
+        expect(compaction.traceId).toBe(createDshCompactionTraceId(dshSessionId, 'e2e-compaction'))
+        expect(compaction.parentSpanId).toBe(SYNTHETIC_PARENT_SPAN_ID)
+        expect(attr(compaction, 'langfuse.observation.type')).toEqual({ stringValue: 'generation' })
+        expect(attr(compaction, 'langfuse.observation.output')).toEqual({ stringValue: '"e2e compacted context"' })
+        expect(attr(compaction, 'dsh.compaction.shadowed_token_count')).toEqual({ intValue: 512 })
+        expect(attr(compaction, 'dsh.compaction.summary_seen')).toEqual({ boolValue: true })
 
         // Correlation identity rides every span on the wire — Langfuse v4
         // filters per observation, so the root-span stamp alone is not enough.

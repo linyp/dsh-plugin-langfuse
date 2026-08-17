@@ -1,7 +1,7 @@
 {
   "name": "dsh-plugin-langfuse",
-  "version": "0.2.0",
-  "description": "Langfuse observability for DeepSeek Harness: OpenTelemetry traces, feedback Scores, and fork lineage",
+  "version": "0.3.0",
+  "description": "Langfuse observability for DeepSeek Harness: OpenTelemetry traces, compaction, feedback Scores, and fork lineage",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

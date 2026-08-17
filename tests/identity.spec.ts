@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import { TraceFlags, trace } from '@opentelemetry/api'
 import {
   SYNTHETIC_PARENT_SPAN_ID,
+  createCompactionParentContext,
+  createDshCompactionTraceId,
   createDshTurnTraceId,
   createTurnParentContext,
   parseW3CTraceContext,
@@ -36,6 +38,33 @@ describe('stable turn identity', () => {
       isRemote: true,
     })
     expect(trace.getSpanContext(resolved.parentContext)).toEqual(resolved.parentSpanContext)
+  })
+})
+
+describe('stable standalone compaction identity', () => {
+  it('keeps fixed SHA-256 test vectors in a domain separate from turns', () => {
+    expect(createDshCompactionTraceId('ses-test-1', 'cmp-1')).toBe('eea7dde7734fc6e5405003d725b1bd0b')
+    expect(createDshCompactionTraceId('你好-session', 'compact-42')).toBe('6d5839126fcb7d9ad9f7b6c481d0713c')
+    expect(createDshCompactionTraceId('ses-test-1', '1')).not.toBe(createDshTurnTraceId('ses-test-1', 1))
+  })
+
+  it('rejects empty canonical identity fields', () => {
+    expect(() => createDshCompactionTraceId('', 'cmp-1')).toThrow(/dshSessionId must be non-empty/)
+    expect(() => createDshCompactionTraceId('session', '')).toThrow(/compactionId must be non-empty/)
+  })
+
+  it('uses the same explicit-parent rules as a turn root', () => {
+    const deterministic = createCompactionParentContext({ dshSessionId: 'ses-test-1', compactionId: 'cmp-1' })
+    expect(deterministic.traceId).toBe(createDshCompactionTraceId('ses-test-1', 'cmp-1'))
+    expect(deterministic.parentSpanContext.spanId).toBe(SYNTHETIC_PARENT_SPAN_ID)
+
+    const external = createCompactionParentContext({
+      dshSessionId: 'ses-test-1',
+      compactionId: 'cmp-1',
+      traceparent: TRACEPARENT,
+    })
+    expect(external.traceId).toBe(EXTERNAL_TRACE_ID)
+    expect(external.deterministicTraceId).toBe(deterministic.deterministicTraceId)
   })
 })
 

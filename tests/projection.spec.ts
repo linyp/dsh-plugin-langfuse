@@ -14,7 +14,11 @@ import {
   type ReadableSpan,
 } from '@opentelemetry/sdk-trace-base'
 import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
-import { createDshTurnTraceId, SYNTHETIC_PARENT_SPAN_ID } from '../src/identity.ts'
+import {
+  createDshCompactionTraceId,
+  createDshTurnTraceId,
+  SYNTHETIC_PARENT_SPAN_ID,
+} from '../src/identity.ts'
 import { SessionSpanFolder } from '../src/projection.ts'
 
 const SESSION_ID = 'ses-test-1'
@@ -220,6 +224,198 @@ describe('SessionSpanFolder', () => {
     expect(spans.get('turn 1')!.attributes['dsh.force_ended']).toBe(true)
     expect(millis(spans.get('turn 1')!.endTime)).toBe(2_000)
     expect(spans.get('turn 2')!.attributes['dsh.force_ended']).toBeUndefined()
+  })
+
+  it('folds an owned compaction into one generation beneath its turn', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('user/message', 2, 1_010, {
+      role: 'user',
+      content: [{ type: 'text', text: 'original human prompt' }],
+      source: { kind: 'user' },
+    }))
+    folder.fold(ledger('compaction/start', 3, 1_100, {
+      compactionId: 'cmp-1',
+      sourceCommandId: 'cmd-1',
+      turn: 1,
+    }))
+    folder.fold(ledger('compaction/summary', 4, 1_500, {
+      compactionId: 'cmp-1',
+      sourceCommandId: 'cmd-1',
+      summary: 'The compacted context',
+      shadowedRange: { start: 10, end: 14 },
+      shadowedSeqs: [10, 11, 12, 13, 14],
+      shadowedTokenCount: 8_000,
+      provider: 'anthropic',
+      model: 'claude-sonnet',
+      maxTokens: 2_048,
+      usage: { inputTokens: 100, outputTokens: 12 },
+      rawOutput: 'must-never-be-exported',
+    }))
+    folder.fold(ledger('user/message', 5, 1_510, {
+      role: 'user',
+      content: [{ type: 'text', text: 'compacted checkpoint replacement' }],
+      source: { kind: 'plugin', plugin: 'compact', compactionId: 'cmp-1' },
+    }))
+    folder.fold(ledger('compaction/end', 6, 1_600, {
+      compactionId: 'cmp-1',
+      sourceCommandId: 'cmd-1',
+      turn: 1,
+    }))
+    folder.fold(ledger('turn/end', 7, 2_000, { turn: 1, reason: { kind: 'completed' } }))
+
+    const spans = spansByName()
+    const turn = spans.get('turn 1')!
+    const compaction = spans.get('compaction')!
+    expect(compaction.spanContext().traceId).toBe(turn.spanContext().traceId)
+    expect(compaction.parentSpanContext?.spanId).toBe(turn.spanContext().spanId)
+    expect(compaction.attributes['dsh.session.id']).toBeUndefined()
+    expect(compaction.attributes).toMatchObject({
+      'langfuse.observation.type': 'generation',
+      'dsh.compaction.id': 'cmp-1',
+      'dsh.compaction.source_command_id': 'cmd-1',
+      'dsh.compaction.duration_scope': 'transaction',
+      'dsh.compaction.summary_seen': true,
+      'dsh.compaction.shadowed_seq_start': 10,
+      'dsh.compaction.shadowed_seq_end': 14,
+      'dsh.compaction.shadowed_event_count': 5,
+      'dsh.compaction.shadowed_token_count': 8_000,
+      'gen_ai.provider.name': 'anthropic',
+      'gen_ai.request.model': 'claude-sonnet',
+      'gen_ai.request.max_tokens': 2_048,
+      'gen_ai.usage.input_tokens': 100,
+      'gen_ai.usage.output_tokens': 12,
+    })
+    expect(compaction.attributes['langfuse.observation.output']).toContain('The compacted context')
+    expect(compaction.attributes['langfuse.observation.input']).not.toContain('shadowedSeqs')
+    expect(JSON.stringify(compaction.attributes)).not.toContain('must-never-be-exported')
+    expect(millis(compaction.startTime)).toBe(1_100)
+    expect(millis(compaction.endTime)).toBe(1_600)
+    expect(compaction.status.code).toBe(SpanStatusCode.UNSET)
+    expect(turn.attributes['langfuse.observation.input']).toContain('original human prompt')
+    expect(turn.attributes['langfuse.observation.input']).not.toContain('compacted checkpoint replacement')
+  })
+
+  it('gives an ownerless compaction a stable standalone trace identity', () => {
+    folder.fold(ledger('compaction/start', 1, 1_000, {
+      compactionId: 'cmp-standalone',
+      turn: null,
+    }, 'info', {
+      'langfuse.session.id': 'host-session',
+      'langfuse.user.id': 'host-user',
+    }))
+    folder.fold(ledger('compaction/summary', 2, 1_100, {
+      compactionId: 'cmp-standalone',
+      summary: 'standalone summary',
+      shadowedRange: { start: 1, end: 3 },
+      shadowedSeqs: [1, 2, 3],
+      shadowedTokenCount: 900,
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+    }))
+    folder.fold(ledger('compaction/end', 3, 1_200, {
+      compactionId: 'cmp-standalone',
+      turn: null,
+    }))
+
+    const compaction = spansByName().get('compaction')!
+    const traceId = createDshCompactionTraceId(SESSION_ID, 'cmp-standalone')
+    expect(compaction.spanContext().traceId).toBe(traceId)
+    expect(compaction.parentSpanContext).toMatchObject({
+      traceId,
+      spanId: SYNTHETIC_PARENT_SPAN_ID,
+      traceFlags: TraceFlags.SAMPLED,
+    })
+    expect(compaction.attributes).toMatchObject({
+      'langfuse.session.id': 'host-session',
+      'langfuse.user.id': 'host-user',
+      'dsh.session.id': SESSION_ID,
+      'dsh.trace.deterministic_id': traceId,
+      'dsh.trace.logical_root': true,
+      'langfuse.internal.is_app_root': true,
+      'langfuse.trace.name': 'dsh compaction',
+    })
+    expect(compaction.attributes['dsh.compaction.orphaned_owner']).toBeUndefined()
+  })
+
+  it('surfaces incomplete, orphaned, malformed, and prune compaction states', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('compaction/summary', 2, 1_010, {
+      compactionId: 'missing-start',
+      summary: 'not promoted to a fabricated span',
+      shadowedRange: { start: 1, end: 1 },
+      shadowedSeqs: [1],
+      shadowedTokenCount: 10,
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+    }))
+    folder.fold(ledger('compaction/prune', 3, 1_020, {
+      shadowedRange: { start: 2, end: 4 },
+      shadowedSeqs: [2, 3, 4],
+      shadowedTokenCount: 300,
+    }))
+    folder.fold(ledger('compaction/start', 4, 1_030, {
+      compactionId: 'cmp-orphan',
+      turn: 99,
+    }))
+    folder.fold(ledger('compaction/end', 5, 1_040, {
+      compactionId: 'cmp-orphan',
+      turn: 99,
+    }))
+    folder.fold(ledger('turn/end', 6, 1_050, { turn: 1, reason: { kind: 'completed' } }))
+
+    const spans = spansByName()
+    const turn = spans.get('turn 1')!
+    expect(turn.events).toContainEqual(expect.objectContaining({ name: 'compaction/summary' }))
+    expect(turn.events).toContainEqual(expect.objectContaining({
+      name: 'compaction/prune',
+      attributes: expect.objectContaining({
+        'dsh.compaction.shadowed_event_count': 3,
+        'dsh.compaction.shadowed_token_count': 300,
+      }),
+    }))
+    const compaction = spans.get('compaction')!
+    expect(compaction.attributes['dsh.compaction.orphaned_owner']).toBe(true)
+    expect(compaction.attributes['dsh.compaction.summary_seen']).toBe(false)
+    expect(compaction.status.code).toBe(SpanStatusCode.ERROR)
+    expect(compaction.attributes['dsh.compaction.error']).toContain('before compaction/summary')
+  })
+
+  it('force-ends an open compaction before its parent turn', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('compaction/start', 2, 1_010, { compactionId: 'cmp-open', turn: 1 }))
+    folder.endAll(5_000)
+
+    const spans = spansByName()
+    const compaction = spans.get('compaction')!
+    const turn = spans.get('turn 1')!
+    expect(compaction.attributes['dsh.force_ended']).toBe(true)
+    expect(compaction.status.code).toBe(SpanStatusCode.ERROR)
+    expect(millis(compaction.endTime)).toBe(5_000)
+    expect(millis(turn.endTime)).toBe(5_000)
+  })
+
+  it('deduplicates the same open id and force-closes a conflicting lifecycle', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('compaction/start', 2, 1_010, { compactionId: 'cmp-first', turn: 1 }))
+    folder.fold(ledger('compaction/start', 3, 1_020, { compactionId: 'cmp-first', turn: 1 }))
+    folder.fold(ledger('compaction/start', 4, 1_030, { compactionId: 'cmp-second', turn: 1 }))
+    folder.fold(ledger('compaction/end', 5, 1_040, {
+      compactionId: 'cmp-second',
+      turn: 1,
+      error: 'provider rejected the request',
+    }))
+    folder.fold(ledger('turn/end', 6, 1_050, { turn: 1, reason: { kind: 'completed' } }))
+
+    const compactions = exporter.getFinishedSpans().filter(span => span.name === 'compaction')
+    expect(compactions).toHaveLength(2)
+    const first = compactions.find(span => span.attributes['dsh.compaction.id'] === 'cmp-first')!
+    const second = compactions.find(span => span.attributes['dsh.compaction.id'] === 'cmp-second')!
+    expect(first.events.map(event => event.name)).toContain('compaction/start.duplicate')
+    expect(first.attributes['dsh.force_ended']).toBe(true)
+    expect(millis(first.endTime)).toBe(1_030)
+    expect(second.status.code).toBe(SpanStatusCode.ERROR)
+    expect(second.attributes['dsh.compaction.error']).toContain('provider rejected the request')
+    expect(second.attributes['dsh.force_ended']).toBeUndefined()
   })
 
   it('lands unknown event types as span events on the open turn', () => {

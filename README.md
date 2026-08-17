@@ -73,8 +73,8 @@ config:
     sessionId: !!js process.env.HOST_SESSION_ID
 ```
 
-- The resolved `langfuse.session.id`/`langfuse.user.id` ride **every** exported span — turn, generation, and tool — because Langfuse's v4 query model filters and aggregates per observation, not only per trace ([propagation contract](https://langfuse.com/integrations/native/opentelemetry#important-propagating-trace-attributes-to-all-spans)).
-- `sessionId` defaults to the dsh session id, and the original dsh session id always stays on the turn root as `dsh.session.id` — the pointer back into `$DSH_HOME/sessions` for local diagnosis.
+- The resolved `langfuse.session.id`/`langfuse.user.id` ride **every** exported span — turn, generation, tool, and compaction — because Langfuse's v4 query model filters and aggregates per observation, not only per trace ([propagation contract](https://langfuse.com/integrations/native/opentelemetry#important-propagating-trace-attributes-to-all-spans)).
+- `sessionId` defaults to the dsh session id, and the original dsh session id stays on each logical root as `dsh.session.id` — the pointer back into `$DSH_HOME/sessions` for local diagnosis.
 - **Per-turn dynamic override**: a `turn/start` record carrying `langfuse.user.id`/`langfuse.session.id` attributes overrides the static config for that turn — a deployment injects them through a `session-telemetry/record` waterfall listener. The snapshot is locked at `turn/start`; identity attributes on later records are ignored. Precedence: record attributes > `correlation` config > dsh session id.
 - A dynamic mapping must be deterministic and rebuildable from the dsh session id, and must survive for as long as the session can still trigger a `FEEDBACK_ONLY` replay — otherwise the replayed tree exports under a different identity than live capture would have.
 - Static `correlation` values bypass the redaction waterfall: the waterfall transforms records, and these values never transit one.
@@ -93,7 +93,9 @@ config:
 | `feedback/record` | session-level `dsh_user_feedback` TEXT Score when `feedbackScores.enabled`; only the post-waterfall canonical text is eligible |
 | forked child session | independent child turn trace plus queryable parent/seed metadata; an OTel Link points to the completed parent turn when its in-process context is retained |
 | `agent-error` ops record | `agent-error` span event + status ERROR on the open turn |
-| every other event type (todo, plan, compaction, hooks, plugin events) | point-in-time span event on the open turn |
+| `compaction/start` + `compaction/summary` + `compaction/end` | one **generation** spanning the whole compaction transaction; child of its owning turn when available, otherwise a stable standalone trace; includes provider/model/usage and shadowed range/count/token statistics |
+| `compaction/prune` | point-in-time span event with the pruned range/count/token statistics |
+| every other event type (todo, plan, hooks, plugin events) | point-in-time span event on the open turn |
 
 Token accounting follows the OpenTelemetry GenAI inclusive-total contract. DSH reports mutually exclusive input buckets (`inputTokens` is uncached input), so the exported `gen_ai.usage.input_tokens` is reconstructed as `inputTokens + cacheReadTokens + cacheWriteTokens`; cache read/write and reasoning remain canonical detail attributes. Langfuse can then normalize them into mutually exclusive usage buckets exactly once.
 
@@ -118,7 +120,7 @@ The trace pipeline is the plain OTel traces SDK (`BasicTracerProvider` → `Batc
 
 ### 3. A folding projection, because the seam hands over a flat stream and Langfuse needs a tree
 
-The seam's records mirror session-log events one-to-one; Langfuse needs trace → observation hierarchy. `SessionSpanFolder` is a state machine keyed by `(session.id, turn, step)` that folds records into open OTel spans. Its contract-critical choices:
+The seam's records mirror session-log events one-to-one; Langfuse needs trace → observation hierarchy. `SessionSpanFolder` is a state machine keyed by `(session.id, turn, step, compactionId)` that folds records into open OTel spans. Its contract-critical choices:
 
 - **Timestamps always come from the record's `time`, never the wall clock**, so live capture and `FEEDBACK_ONLY` canonical-log replay produce identical trees (span start/end times are explicit — the OTel API supports historical stamps).
 - **`seq` gaps are routine, never a loss signal**: the seam ships only the first `assistant/chunk` per step (the stream-started signal; its time is the first-token time). The folder relies on this instead of counting.
@@ -126,12 +128,13 @@ The seam's records mirror session-log events one-to-one; Langfuse needs trace �
 - **Tool spans are children of their step's generation span**: the harness defines a step as one model request *plus the tools it calls* — `tool/call` and `tool/result` land inside the step's boundaries — so the generation span temporally contains its tool executions. A call whose step is no longer open (crash-window replay) falls back to the turn span.
 - **Overall turn input/output live on the root observation for Langfuse v4**: `user/message` supplies its input, and each completed assistant message replaces its output so the final message remains at turn end. Deprecated `langfuse.trace.input/output` aliases are emitted only for legacy trace-level evaluator compatibility.
 - **Unknown event types land as span events on the open turn** — the event vocabulary is merge-extensible, and dropping unknown types would silently thin the timeline.
+- **Compaction is one transaction Generation** from `compaction/start` through `compaction/end`. Its duration deliberately includes orchestration around the provider call and is not labeled as pure model latency. `compaction/summary` enriches the span with the compacted summary, provider/model/usage, and aggregate shadow statistics; provider `rawOutput` and the full `shadowedSeqs` list are never exported. The paired replacement `user/message` (`source.plugin=compact`) remains model-visible context but never overwrites the turn's human input. A missing owner becomes a stable standalone trace, while missing/malformed lifecycle records degrade to point events or an ERROR span rather than fabricated timing.
 - **Force-end sweeps** close still-open spans (marked `dsh.force_ended`) on a next `turn/start` with an open predecessor, on the session's ops `shutdown` record, and on backend shutdown — teardown never abandons started spans inside the SDK queue.
 
 ### 4. Stable identity, feedback Scores, and fork lineage
 
-- A versioned SHA-256 identity derived from `(dsh session id, turn)` supplies a stable 32-hex Trace ID across live export and `FEEDBACK_ONLY` replay. A valid per-turn W3C `traceparent` still wins for distributed tracing; the deterministic ID remains queryable metadata.
-- Canonical feedback becomes a session-level `dsh_user_feedback` TEXT Score through a bounded single-worker queue. It uses a deterministic Score ID, retries transient failures with the same ID, and never blocks or fails the agent loop. Because the source event has no rating or target turn, 0.2.x deliberately does not invent one.
+- Versioned SHA-256 identities derived from `(dsh session id, turn)` and `(dsh session id, compaction id)` supply stable 32-hex Trace IDs across live export and `FEEDBACK_ONLY` replay. A valid W3C `traceparent` still wins for distributed tracing; the deterministic ID remains queryable metadata.
+- Canonical feedback becomes a session-level `dsh_user_feedback` TEXT Score through a bounded single-worker queue. It uses a deterministic Score ID, retries transient failures with the same ID, and never blocks or fails the agent loop. Because the source event has no rating or target turn, the plugin deliberately does not invent one.
 - Every child turn carries direct parent session, seed boundary, and resolved parent Trace ID metadata. If the completed parent root SpanContext remains in the bounded in-process registry, the child root also contains one OTel Link. Missing/evicted/cross-process parents degrade to metadata with `dsh.lineage.linked=false`; no context is fabricated.
 
 ### 5. Delivery semantics: at-most-once handoff, duplicates possible
@@ -140,7 +143,7 @@ Inherited from the seam: the cursor marks *handed off*, not delivered; whatever 
 
 ### 6. What leaves the machine
 
-In uploading modes, span attributes carry user and assistant message content, tool arguments and results, and model/usage metadata, as returned by the `session-telemetry/record` waterfall. **This plugin ships no redaction rules**; a deployment exporting beyond a trusted boundary mounts its own waterfall listener. Provider API keys are structurally absent (they are constructor parameters, never session events). Serialized payloads are clipped at `maxAttributeChars` per attribute (default 32768); the canonical log keeps the full bytes.
+In uploading modes, span attributes carry user and assistant message content, tool arguments and results, compaction summaries and aggregate shadow statistics, and model/usage metadata, as returned by the `session-telemetry/record` waterfall. Compaction provider `rawOutput` and full `shadowedSeqs` lists are deliberately omitted. **This plugin ships no redaction rules**; a deployment exporting beyond a trusted boundary mounts its own waterfall listener. Provider API keys are structurally absent (they are constructor parameters, never session events). Serialized payloads are clipped at `maxAttributeChars` per attribute (default 32768); the canonical log keeps the full bytes.
 
 ## Model Experience
 
@@ -160,7 +163,7 @@ npm run build && npm run test:e2e   # REAL composition: boots a real dsh app via
 npm run test:package           # npm pack + empty-consumer install/import + bundle composition
 ```
 
-The e2e follows the official repository's REAL-composition pattern (`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`): the fixture `cordis.yml` loads the **built** `lib/index.js` — the same file a deployment loads — and assertions run against the wire, not against internals.
+The e2e follows the official repository's REAL-composition pattern (`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`): the fixture `cordis.yml` loads the **built** `lib/index.js` — the same file a deployment loads — and assertions run against the wire, including a standalone compaction trace, not against internals.
 
 When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output, usage, per-observation correlation, parent/child metadata, and the Scores API for feedback readback. Without keys, that test self-skips.
 
@@ -172,6 +175,9 @@ DeepSeek Harness is in developer preview with no compatibility promises; this pl
 |---|---|
 | 0.1.x | 0.1.0-rc.6 |
 | 0.2.x | 0.1.0-rc.6 |
+| 0.3.x | 0.1.0-rc.6 |
+
+The separate **Upstream compatibility canary** workflow resolves every `@deepseek-ai/*` dependency to its newest published version. Pull requests and `main` pushes are advisory; the weekly schedule and manual dispatch are strict and run typecheck, unit tests, build, REAL-composition e2e, and package smoke. Failed runs retain the resolved manifest and lockfile for reproduction.
 
 ## Known limitations and deferred work
 

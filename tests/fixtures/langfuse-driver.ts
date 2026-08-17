@@ -53,6 +53,21 @@ try {
   const session = ctx.get('sessions')?.list()[0]
   if (session === undefined) throw new Error('langfuse driver saw no session after the fixture turn')
   recordFeedback(session, 'e2e feedback score')
+  // Exercise the merge-extensible session vocabulary without taking a direct
+  // dependency on the compaction plugin's release-candidate peer graph.
+  const appendExtensionEvent = session.append.bind(session) as unknown as (type: string, data: unknown) => void
+  appendExtensionEvent('compaction/start', { compactionId: 'e2e-compaction', turn: null })
+  appendExtensionEvent('compaction/summary', {
+    compactionId: 'e2e-compaction',
+    summary: 'e2e compacted context',
+    shadowedRange: { start: 1, end: 3 },
+    shadowedSeqs: [1, 2, 3],
+    shadowedTokenCount: 512,
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+    usage: { inputTokens: 8, outputTokens: 2 },
+  })
+  appendExtensionEvent('compaction/end', { compactionId: 'e2e-compaction', turn: null })
   // Exercise the real SessionStore fork path: inherited seed rows are not
   // re-emitted, while every live child row carries parent/seed attributes.
   const child = ctx.sessions.fork(session)

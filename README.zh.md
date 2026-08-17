@@ -73,8 +73,8 @@ config:
     sessionId: !!js process.env.HOST_SESSION_ID
 ```
 
-- 解析出的 `langfuse.session.id`/`langfuse.user.id` 会盖在**每个**导出 span 上——turn、generation、tool——因为 Langfuse v4 的查询模型按 observation 而非仅按 trace 过滤与聚合（[属性传播合约](https://langfuse.com/integrations/native/opentelemetry#important-propagating-trace-attributes-to-all-spans)）。
-- `sessionId` 默认取 dsh session id；原始 dsh session id 始终以 `dsh.session.id` 留在 turn 根 span 上——这是回查 `$DSH_HOME/sessions` 本地日志的指针。
+- 解析出的 `langfuse.session.id`/`langfuse.user.id` 会盖在**每个**导出 span 上——turn、generation、tool、compaction——因为 Langfuse v4 的查询模型按 observation 而非仅按 trace 过滤与聚合（[属性传播合约](https://langfuse.com/integrations/native/opentelemetry#important-propagating-trace-attributes-to-all-spans)）。
+- `sessionId` 默认取 dsh session id；原始 dsh session id 始终以 `dsh.session.id` 留在每个逻辑根上——这是回查 `$DSH_HOME/sessions` 本地日志的指针。
 - **按轮动态覆盖**：`turn/start` record 上携带的 `langfuse.user.id`/`langfuse.session.id` 属性覆盖该轮的静态配置——部署方通过 `session-telemetry/record` waterfall listener 注入。快照在 `turn/start` 时锁定；之后 record 上的身份属性一律忽略。优先级：record 属性 > `correlation` 配置 > dsh session id。
 - 动态映射必须可从 dsh session id 确定性重建，且至少存活到该会话不再可能触发 `FEEDBACK_ONLY` 重放为止——否则重放出的树会带上与实时捕获不同的身份。
 - 静态 `correlation` 值不经过脱敏 waterfall：waterfall 只变换 record，而这些值从不途经 record。
@@ -93,7 +93,9 @@ config:
 | `feedback/record` | `feedbackScores.enabled` 时成为 session-level `dsh_user_feedback` TEXT Score；只有 canonical 且经过 waterfall 的文本有资格发送 |
 | fork child session | 独立的 child turn trace，并带可查询的 parent/seed metadata；进程内仍保留父 turn context 时附加指向它的 OTel Link |
 | `agent-error` ops 记录 | 开放 turn 上的 `agent-error` span event + 状态 ERROR |
-| 其他所有事件类型（todo、plan、compaction、hooks、插件事件） | 开放 turn 上的时间点 span event |
+| `compaction/start` + `compaction/summary` + `compaction/end` | 一个覆盖完整压缩事务的 **generation**；能找到所属 turn 时作为其子节点，否则成为稳定的独立 trace；包含 provider/model/usage 与被遮蔽范围、事件数、token 数统计 |
+| `compaction/prune` | 带裁剪范围、事件数和 token 数统计的时间点 span event |
+| 其他所有事件类型（todo、plan、hooks、插件事件） | 开放 turn 上的时间点 span event |
 
 Token 计量遵循 OpenTelemetry GenAI 的 inclusive-total 契约。DSH 报告的是互斥输入 buckets（`inputTokens` 仅包含未缓存输入），因此导出的 `gen_ai.usage.input_tokens` 会重建为 `inputTokens + cacheReadTokens + cacheWriteTokens`；cache read/write 与 reasoning 继续作为规范的明细属性。Langfuse 随后只需执行一次归一化，即可得到互斥 usage buckets。
 
@@ -118,7 +120,7 @@ Trace 管线使用原生 OTel traces SDK（`BasicTracerProvider` → `BatchSpanP
 
 ### 3. 折叠投影 —— 因为 seam 交来扁平流，而 Langfuse 需要树
 
-seam 的记录与会话日志事件一一对应；Langfuse 需要 trace → observation 层级。`SessionSpanFolder` 是按 `(session.id, turn, step)` 键控的状态机，把记录折叠进开放的 OTel span。契约关键的选择：
+seam 的记录与会话日志事件一一对应；Langfuse 需要 trace → observation 层级。`SessionSpanFolder` 是按 `(session.id, turn, step, compactionId)` 键控的状态机，把记录折叠进开放的 OTel span。契约关键的选择：
 
 - **时间戳永远取记录的 `time`，绝不取墙钟**，因此实时捕获与 `FEEDBACK_ONLY` 的 canonical 日志重放产出完全相同的树（span 起止时间显式指定 —— OTel API 支持历史时间戳）。
 - **`seq` 空洞是常态，绝不是丢失信号**：seam 每个 step 只发首个 `assistant/chunk`（流已启动信号；其时间即首 token 时间）。折叠器依赖这一点而非计数。
@@ -126,12 +128,13 @@ seam 的记录与会话日志事件一一对应；Langfuse 需要 trace → obse
 - **tool span 是其 step 的 generation span 的子节点**：harness 定义 step 为一次模型请求*加上它调用的工具* —— `tool/call` 与 `tool/result` 都落在 step 边界之内 —— 因此 generation span 在时间上包含它的工具执行。step 已不再开放的调用（崩溃窗口重放）回退挂到 turn span。
 - **整轮 input/output 按 Langfuse v4 合约放在根 observation 上**：`user/message` 提供 input；每条完成的 assistant message 覆盖 output，因此 turn 结束时保留最后一条回复。已弃用的 `langfuse.trace.input/output` 别名仅用于兼容旧版 trace-level evaluator。
 - **未知事件类型落为开放 turn 上的 span event** —— 事件词汇表是 merge-extensible 的，丢弃未知类型会悄悄稀释时间线。
+- **Compaction 是从 `compaction/start` 到 `compaction/end` 的单个事务 Generation**。它的时长有意包含 provider 调用外围的编排时间，不标成纯模型延迟。`compaction/summary` 用压缩摘要、provider/model/usage 与聚合后的 shadow 统计补全 span；provider `rawOutput` 和完整 `shadowedSeqs` 列表永不导出。与其配对的替换型 `user/message`（`source.plugin=compact`）仍是模型可见上下文，但不会覆盖 turn 的真人输入。所属 turn 缺失时生成稳定的独立 trace；生命周期记录缺失或畸形时降级为时间点事件或 ERROR span，不伪造时长。
 - **强制收尾扫描**在三处关闭仍开放的 span（标记 `dsh.force_ended`）：新 `turn/start` 到来而前一个 turn 未闭合、会话的 ops `shutdown` 记录、后端 shutdown —— teardown 绝不把已开始的 span 遗弃在 SDK 队列里。
 
 ### 4. 稳定身份、feedback Score 与 fork 血缘
 
-- 对 `(dsh session id, turn)` 做带版本的 SHA-256 派生，使实时导出与 `FEEDBACK_ONLY` 重放得到相同的 32 位十六进制 Trace ID。合法的逐 turn W3C `traceparent` 仍优先用于分布式追踪；确定性 ID 保留为可查询 metadata。
-- Canonical feedback 经有界单 worker 队列成为 session-level `dsh_user_feedback` TEXT Score。它使用确定性 Score ID，以同一个 ID 重试瞬时失败，且永不阻塞或破坏 agent loop。源事件没有 rating 或目标 turn，因此 0.2.x 不推测这些语义。
+- 分别对 `(dsh session id, turn)` 与 `(dsh session id, compaction id)` 做带版本的 SHA-256 派生，使实时导出与 `FEEDBACK_ONLY` 重放得到稳定的 32 位十六进制 Trace ID。合法的 W3C `traceparent` 仍优先用于分布式追踪；确定性 ID 保留为可查询 metadata。
+- Canonical feedback 经有界单 worker 队列成为 session-level `dsh_user_feedback` TEXT Score。它使用确定性 Score ID，以同一个 ID 重试瞬时失败，且永不阻塞或破坏 agent loop。源事件没有 rating 或目标 turn，因此插件不会推测这些语义。
 - 每个 child turn 都带直接父 session、seed boundary 和可解析的父 Trace ID metadata。若有界进程内 registry 仍保存已完成父 turn 的根 SpanContext，child root 还会携带一个 OTel Link。父 context 缺失、淘汰或跨进程时降级为 metadata 和 `dsh.lineage.linked=false`，绝不伪造 context。
 
 ### 5. 投递语义：at-most-once handoff，可能重复
@@ -140,7 +143,7 @@ seam 的记录与会话日志事件一一对应；Langfuse 需要 trace → obse
 
 ### 6. 什么数据离开本机
 
-上传模式下，span 属性携带用户与助手消息内容、工具参数与结果、模型/用量元数据，以 `session-telemetry/record` waterfall 的返回值为准。**本插件不带任何脱敏规则**；导出跨越信任边界的部署需自行挂载 waterfall listener。Provider API key 结构性缺席（它们是构造参数，从不是会话事件）。序列化 payload 每属性按 `maxAttributeChars` 裁剪（默认 32768）；canonical 日志保留完整字节。
+上传模式下，span 属性携带用户与助手消息内容、工具参数与结果、compaction 摘要与聚合 shadow 统计、模型/用量元数据，以 `session-telemetry/record` waterfall 的返回值为准。Compaction provider `rawOutput` 和完整 `shadowedSeqs` 列表会被明确排除。**本插件不带任何脱敏规则**；导出跨越信任边界的部署需自行挂载 waterfall listener。Provider API key 结构性缺席（它们是构造参数，从不是会话事件）。序列化 payload 每属性按 `maxAttributeChars` 裁剪（默认 32768）；canonical 日志保留完整字节。
 
 ## Model Experience
 
@@ -160,7 +163,7 @@ npm run build && npm run test:e2e   # REAL composition：经 Loader 启动真实
 npm run test:package           # npm pack + 空 consumer 安装/import + bundle 组合
 ```
 
-e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`）：fixture `cordis.yml` 加载**构建产物** `lib/index.js` —— 与部署加载的是同一个文件 —— 断言针对 wire，而非内部实现。
+e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`）：fixture `cordis.yml` 加载**构建产物** `lib/index.js` —— 与部署加载的是同一个文件 —— 断言针对 wire（包括独立 compaction trace），而非内部实现。
 
 存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata，并通过 Scores API 回读 feedback；未提供密钥时该测试自行跳过。
 
@@ -172,6 +175,9 @@ DeepSeek Harness 处于 developer preview，无兼容承诺；本插件精确锁
 |---|---|
 | 0.1.x | 0.1.0-rc.6 |
 | 0.2.x | 0.1.0-rc.6 |
+| 0.3.x | 0.1.0-rc.6 |
+
+独立的 **Upstream compatibility canary** 工作流会把所有 `@deepseek-ai/*` 依赖解析到最新发布版本。Pull request 与 `main` push 只做预警；每周定时和手动触发严格失败，并依次运行 typecheck、单测、构建、REAL-composition e2e 与 package smoke。失败运行会保留解析后的 manifest 和 lockfile，便于复现。
 
 ## 已知限制与延后工作
 

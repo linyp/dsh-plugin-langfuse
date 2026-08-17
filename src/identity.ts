@@ -20,6 +20,7 @@ import {
 } from '@opentelemetry/api'
 
 const TURN_TRACE_ID_NAMESPACE = 'dsh-plugin-langfuse:turn-trace:v1'
+const COMPACTION_TRACE_ID_NAMESPACE = 'dsh-plugin-langfuse:compaction-trace:v1'
 const FEEDBACK_SCORE_ID_NAMESPACE = 'dsh-plugin-langfuse:feedback-score:v1'
 const INVALID_TRACE_ID = '00000000000000000000000000000000'
 
@@ -52,11 +53,23 @@ export interface TurnParentContext {
   invalidExternalContext: boolean
 }
 
+/** Parent context selected before a standalone compaction root is created. */
+export type CompactionParentContext = TurnParentContext
+
+/** Finish one versioned SHA-256 identity as a valid W3C 128-bit Trace ID. */
+function finishTraceId(hash: ReturnType<typeof createHash>): string {
+  const traceId = hash.digest('hex').slice(0, 32)
+  // W3C forbids the all-zero Trace ID. The branch is astronomically unlikely,
+  // but keeping it explicit makes every deterministic namespace valid.
+  return traceId === INVALID_TRACE_ID ? `${traceId.slice(0, -1)}1` : traceId
+}
+
 /**
  * Derive the stable 128-bit Trace ID for one DSH turn.
  *
  * This algorithm is versioned and covered by fixed test vectors. Do not
- * change the namespace, separators, encoding, or truncation in 0.2.x.
+ * change the namespace, separators, encoding, or truncation without a
+ * deliberate identity-version migration.
  */
 export function createDshTurnTraceId(dshSessionId: string, turn: number): string {
   if (typeof dshSessionId !== 'string' || dshSessionId.length === 0) {
@@ -65,17 +78,32 @@ export function createDshTurnTraceId(dshSessionId: string, turn: number): string
   if (!Number.isSafeInteger(turn) || turn < 0) {
     throw new Error(`dsh-plugin-langfuse: turn must be a non-negative safe integer, got ${String(turn)}`)
   }
-  const traceId = createHash('sha256')
+  return finishTraceId(createHash('sha256')
     .update(TURN_TRACE_ID_NAMESPACE)
     .update('\0')
     .update(dshSessionId)
     .update('\0')
-    .update(String(turn))
-    .digest('hex')
-    .slice(0, 32)
-  // SHA-256 producing 128 zero prefix bits is astronomically unlikely, but
-  // W3C forbids the all-zero Trace ID, so preserve validity defensively.
-  return traceId === INVALID_TRACE_ID ? `${traceId.slice(0, -1)}1` : traceId
+    .update(String(turn)))
+}
+
+/**
+ * Derive the stable Trace ID for a standalone compaction transaction.
+ * The opaque upstream compaction id is canonical across live capture and
+ * `FEEDBACK_ONLY` replay, so it is the identity input rather than event seq.
+ */
+export function createDshCompactionTraceId(dshSessionId: string, compactionId: string): string {
+  if (typeof dshSessionId !== 'string' || dshSessionId.length === 0) {
+    throw new Error('dsh-plugin-langfuse: dshSessionId must be non-empty')
+  }
+  if (typeof compactionId !== 'string' || compactionId.length === 0) {
+    throw new Error('dsh-plugin-langfuse: compactionId must be non-empty')
+  }
+  return finishTraceId(createHash('sha256')
+    .update(COMPACTION_TRACE_ID_NAMESPACE)
+    .update('\0')
+    .update(dshSessionId)
+    .update('\0')
+    .update(compactionId))
 }
 
 /**
@@ -136,14 +164,34 @@ export function createTurnParentContext(input: {
   tracestate?: string | number
 }): TurnParentContext {
   const deterministicTraceId = createDshTurnTraceId(input.dshSessionId, input.turn)
-  const external = typeof input.traceparent === 'string'
+  return createParentContext(deterministicTraceId, input.traceparent, input.tracestate)
+}
+
+/** Resolve a standalone compaction's explicit carrier or deterministic root. */
+export function createCompactionParentContext(input: {
+  dshSessionId: string
+  compactionId: string
+  traceparent?: string | number
+  tracestate?: string | number
+}): CompactionParentContext {
+  const deterministicTraceId = createDshCompactionTraceId(input.dshSessionId, input.compactionId)
+  return createParentContext(deterministicTraceId, input.traceparent, input.tracestate)
+}
+
+/** Build one explicit parent context around a precomputed deterministic id. */
+function createParentContext(
+  deterministicTraceId: string,
+  traceparent?: string | number,
+  tracestate?: string | number,
+): TurnParentContext {
+  const external = typeof traceparent === 'string'
     ? parseW3CTraceContext(
-        input.traceparent,
-        typeof input.tracestate === 'string' ? input.tracestate : undefined,
+        traceparent,
+        typeof tracestate === 'string' ? tracestate : undefined,
       )
     : undefined
-  const invalidExternalContext = input.traceparent !== undefined || input.tracestate !== undefined
-    ? external === undefined || (input.tracestate !== undefined && typeof input.tracestate !== 'string')
+  const invalidExternalContext = traceparent !== undefined || tracestate !== undefined
+    ? external === undefined || (tracestate !== undefined && typeof tracestate !== 'string')
     : false
   const parentSpanContext: SpanContext = external ?? {
     traceId: deterministicTraceId,
