@@ -47,6 +47,7 @@ import {
   type CompactionParentContext,
 } from './identity.ts'
 import {
+  ATTR_DSH_ASSISTANT_INTERRUPTED,
   ATTR_DSH_COMPACTION_DURATION_SCOPE,
   ATTR_DSH_COMPACTION_ERROR,
   ATTR_DSH_COMPACTION_ID,
@@ -558,7 +559,7 @@ export class SessionSpanFolder {
   }
 
   private foldAssistantMessage(state: SessionState, record: SessionTelemetryRecord): void {
-    const { step, message, usage } = body<'assistant/message'>(record)
+    const { step, message, usage, interrupted } = body<'assistant/message'>(record)
     const stepState = state.turn?.steps.get(step)
     if (stepState === undefined) return
     const output = this.clip(message)
@@ -567,6 +568,10 @@ export class SessionSpanFolder {
       [ATTR_LANGFUSE_OBSERVATION_OUTPUT]: output,
       [ATTR_LANGFUSE_TRACE_OUTPUT]: output,
     })
+    if (interrupted === true) {
+      stepState.span.setAttribute(ATTR_DSH_ASSISTANT_INTERRUPTED, true)
+      state.turn?.span.setAttribute(ATTR_DSH_ASSISTANT_INTERRUPTED, true)
+    }
     if (usage !== undefined) stepState.span.setAttributes(toGenAiUsageAttributes(usage))
   }
 

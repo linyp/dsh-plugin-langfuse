@@ -119,6 +119,7 @@ describe('SessionSpanFolder', () => {
     expect(step.attributes['gen_ai.usage.cache_creation.input_tokens']).toBe(3)
     expect(step.attributes['langfuse.observation.completion_start_time']).toBe(new Date(1_500).toISOString())
     expect(step.attributes['langfuse.observation.output']).toContain('done')
+    expect(step.attributes['dsh.assistant.interrupted']).toBeUndefined()
     expect(millis(step.startTime)).toBe(1_030)
     expect(millis(step.endTime)).toBe(2_020)
 
@@ -150,6 +151,30 @@ describe('SessionSpanFolder', () => {
     expect(spans.get('turn 1')!.status.code).toBe(SpanStatusCode.ERROR)
     // No step/start was folded, so the tool span falls back to the turn parent.
     expect(spans.get('tool bash')!.parentSpanContext?.spanId).toBe(spans.get('turn 1')!.spanContext().spanId)
+  })
+
+  it('preserves interrupted assistant output as a non-error partial completion', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('step/start', 2, 1_010, { turn: 1, step: 0 }))
+    folder.fold(ledger('assistant/message', 3, 1_020, {
+      turn: 1,
+      step: 0,
+      message: { role: 'assistant', content: [{ type: 'text', text: 'partial answer' }] },
+      interrupted: true,
+    }))
+    folder.fold(ledger('step/end', 4, 1_030, { turn: 1, step: 0 }))
+    folder.fold(ledger('turn/end', 5, 1_040, { turn: 1, reason: { kind: 'interrupted' } }))
+
+    const spans = spansByName()
+    const step = spans.get('step 0')!
+    const turn = spans.get('turn 1')!
+    expect(step.attributes['langfuse.observation.output']).toContain('partial answer')
+    expect(turn.attributes['langfuse.observation.output']).toContain('partial answer')
+    expect(step.attributes['dsh.assistant.interrupted']).toBe(true)
+    expect(turn.attributes['dsh.assistant.interrupted']).toBe(true)
+    expect(turn.attributes['dsh.turn.end_reason']).toContain('interrupted')
+    expect(step.status.code).toBe(SpanStatusCode.UNSET)
+    expect(turn.status.code).toBe(SpanStatusCode.UNSET)
   })
 
   it('keeps the latest assistant message as the root observation output', () => {

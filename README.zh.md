@@ -86,7 +86,7 @@ config:
 |---|---|
 | session（`session.id`） | session（每个导出的 observation/span 都带 `langfuse.session.id`） |
 | `turn/start` / `turn/end` | trace 根 observation（root span；错误结束原因置 span 状态为 ERROR） |
-| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** —— 模型、provider、输出、规范的 `gen_ai.usage.*` token（input/output/cache-read/cache-creation/reasoning）；最新一条 assistant message 同时成为根 observation 的整体输出 |
+| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** —— 模型、provider、输出、规范的 `gen_ai.usage.*` token（input/output/cache-read/cache-creation/reasoning）；最新一条 assistant message 同时成为根 observation 的整体输出。Harness rc.8 的中断输出会保留部分内容，并在两层 observation 标记 `dsh.assistant.interrupted=true`，但不会把中断误判为错误 |
 | step 的首个 `assistant/chunk` | `langfuse.observation.completion_start_time`（首 token 时间） |
 | `tool/call` + `tool/result` | tool span（参数为 input，结果为 output，`isError` → 状态 ERROR） |
 | `user/message` | 根 observation input；同时保留已弃用的 trace input，以兼容旧版 evaluator |
@@ -176,6 +176,7 @@ DeepSeek Harness 处于 developer preview，无兼容承诺；本插件精确锁
 | 0.1.x | 0.1.0-rc.6 |
 | 0.2.x | 0.1.0-rc.6 |
 | 0.3.x | 0.1.0-rc.7 |
+| 0.4.x | 0.1.0-rc.8 |
 
 独立的 **Upstream compatibility canary** 工作流会把所有 `@deepseek-ai/*` 依赖解析到最新发布版本。Pull request 与 `main` push 只做预警；每周定时和手动触发严格失败，并依次运行 typecheck、单测、构建、REAL-composition e2e 与 package smoke。失败运行会保留解析后的 manifest 和 lockfile，便于复现。
 

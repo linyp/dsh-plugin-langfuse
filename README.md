@@ -86,7 +86,7 @@ config:
 |---|---|
 | session (`session.id`) | session (`langfuse.session.id` on every exported observation/span) |
 | `turn/start` / `turn/end` | trace root observation (root span; error end reasons set span status ERROR) |
-| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** — model, provider, output, canonical `gen_ai.usage.*` tokens (input/output/cache-read/cache-creation/reasoning); the latest assistant message also becomes the root observation's overall output |
+| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** — model, provider, output, canonical `gen_ai.usage.*` tokens (input/output/cache-read/cache-creation/reasoning); the latest assistant message also becomes the root observation's overall output. Harness rc.8 interrupted partial output is retained and marks both observations with `dsh.assistant.interrupted=true` without classifying the interruption as an error |
 | first `assistant/chunk` of a step | `langfuse.observation.completion_start_time` (time-to-first-token) |
 | `tool/call` + `tool/result` | tool span (arguments as input, result as output, `isError` → status ERROR) |
 | `user/message` | root observation input; deprecated trace input is retained for legacy evaluator compatibility |
@@ -176,6 +176,7 @@ DeepSeek Harness is in developer preview with no compatibility promises; this pl
 | 0.1.x | 0.1.0-rc.6 |
 | 0.2.x | 0.1.0-rc.6 |
 | 0.3.x | 0.1.0-rc.7 |
+| 0.4.x | 0.1.0-rc.8 |
 
 The separate **Upstream compatibility canary** workflow resolves every `@deepseek-ai/*` dependency to its newest published version. Pull requests and `main` pushes are advisory; the weekly schedule and manual dispatch are strict and run typecheck, unit tests, build, REAL-composition e2e, and package smoke. Failed runs retain the resolved manifest and lockfile for reproduction.
 

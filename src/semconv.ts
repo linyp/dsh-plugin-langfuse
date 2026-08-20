@@ -65,6 +65,8 @@ export const ATTR_DSH_EVENT_SEQ = 'dsh.event.seq'
 export const ATTR_DSH_TURN = 'dsh.turn'
 export const ATTR_DSH_STEP = 'dsh.step'
 export const ATTR_DSH_TURN_END_REASON = 'dsh.turn.end_reason'
+/** The assistant output is a partial prefix preserved after generation was interrupted. */
+export const ATTR_DSH_ASSISTANT_INTERRUPTED = 'dsh.assistant.interrupted'
 /** Stable identity and transaction facts for context compaction observations. */
 export const ATTR_DSH_COMPACTION_ID = 'dsh.compaction.id'
 export const ATTR_DSH_COMPACTION_SOURCE_COMMAND_ID = 'dsh.compaction.source_command_id'
