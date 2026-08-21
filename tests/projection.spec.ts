@@ -685,4 +685,209 @@ describe('SessionSpanFolder', () => {
     expect(child.attributes['dsh.lineage.parent_trace_id']).toBeUndefined()
     expect(child.links).toEqual([])
   })
+
+  it('projects request parameters and retries onto the existing generation', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('step/start', 2, 1_010, { turn: 1, step: 1 }))
+    folder.fold(ledger('request/header', 3, 1_020, {
+      header: { config: {
+        provider: 'deepseek',
+        model: 'deepseek-reasoner',
+        maxTokens: 8_192,
+        temperature: 0.2,
+        reasoningEffort: 'high',
+      } },
+      reason: 'initial',
+    }))
+    folder.fold(ledger('request/context', 4, 1_021, {
+      provider: 'deepseek', model: 'deepseek-reasoner', contextWindow: 128_000,
+    }))
+    folder.fold(ledger('llm/retry', 5, 1_030, {
+      retryId: 'retry-1', turn: 1, step: 1, provider: 'deepseek', mode: 'normal',
+      policyKey: 'default', retry: 1, maxRetries: 3, delayMs: 500,
+      failure: { message: 'rate limited', code: 'RATE_LIMIT', status: 429 },
+    }))
+    folder.fold(ledger('llm/retry-started', 6, 1_530, {
+      retryId: 'retry-1', turn: 1, step: 1, retry: 1,
+    }))
+    folder.fold(ledger('step/end', 7, 1_600, { turn: 1, step: 1 }))
+    folder.fold(ledger('turn/end', 8, 1_610, { turn: 1, reason: { kind: 'completed' } }))
+
+    const spans = exporter.getFinishedSpans()
+    expect(spans.filter(span => span.name.startsWith('step '))).toHaveLength(1)
+    const step = spans.find(span => span.name === 'step 1')!
+    expect(step.attributes).toMatchObject({
+      'gen_ai.request.model': 'deepseek-reasoner',
+      'gen_ai.provider.name': 'deepseek',
+      'gen_ai.request.max_tokens': 8_192,
+      'gen_ai.request.temperature': 0.2,
+      'dsh.request.reasoning_effort': 'high',
+      'dsh.request.context_window': 128_000,
+      'dsh.request.header_reason': 'initial',
+    })
+    expect(step.attributes['langfuse.observation.model.parameters']).toContain('reasoningEffort')
+    expect(step.events).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'dsh.llm.retry.scheduled',
+        attributes: expect.objectContaining({
+          'dsh.llm.retry.id': 'retry-1',
+          'dsh.llm.retry.attempt': 1,
+          'dsh.llm.retry.delay_ms': 500,
+          'dsh.llm.retry.failure.code': 'RATE_LIMIT',
+          'dsh.llm.retry.failure.status': 429,
+        }),
+      }),
+      expect.objectContaining({ name: 'dsh.llm.retry.started' }),
+    ]))
+  })
+
+  it('times approval beneath its tool and force-closes an incomplete approval', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('step/start', 2, 1_010, { turn: 1, step: 1 }))
+    folder.fold(ledger('tool/call', 3, 1_020, {
+      turn: 1, step: 1, callId: 'call-1', name: 'bash', arguments: '{}',
+    }))
+    folder.fold(ledger('approval/asked', 4, 1_030, {
+      id: 'approval-1', toolName: 'bash', callId: 'call-1', reason: 'writes outside workspace',
+    }))
+    folder.fold(ledger('approval/decided', 5, 1_130, {
+      id: 'approval-1', outcome: 'rejected',
+    }))
+    folder.fold(ledger('approval/asked', 6, 1_140, {
+      id: 'approval-2', toolName: 'bash', callId: 'call-1',
+    }))
+    folder.endAll(1_200)
+
+    const spans = exporter.getFinishedSpans()
+    const tool = spans.find(span => span.name === 'tool bash')!
+    const approvals = spans.filter(span => span.name === 'approval bash')
+    expect(approvals).toHaveLength(2)
+    expect(approvals[0]!.parentSpanContext?.spanId).toBe(tool.spanContext().spanId)
+    expect(approvals[0]!.attributes).toMatchObject({
+      'dsh.approval.id': 'approval-1',
+      'dsh.approval.outcome': 'rejected',
+      'dsh.approval.reason': 'writes outside workspace',
+    })
+    expect(millis(approvals[0]!.startTime)).toBe(1_030)
+    expect(millis(approvals[0]!.endTime)).toBe(1_130)
+    expect(approvals[0]!.status.code).toBe(SpanStatusCode.UNSET)
+    expect(approvals[1]!.attributes).toMatchObject({
+      'dsh.force_ended': true,
+      'dsh.incomplete_reason': 'turn-ended',
+    })
+    expect(approvals[1]!.status.code).toBe(SpanStatusCode.ERROR)
+  })
+
+  it('closes an inherited orphan compaction at session/end-seed', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('compaction/start', 2, 1_010, { compactionId: 'inherited', turn: 1 }))
+    folder.fold(ledger('session/end-seed', 3, 1_020, {}))
+    folder.fold(ledger('turn/end', 4, 1_030, { turn: 1, reason: { kind: 'completed' } }))
+
+    const compaction = spansByName().get('compaction')!
+    expect(millis(compaction.endTime)).toBe(1_020)
+    expect(compaction.status.code).toBe(SpanStatusCode.ERROR)
+    expect(compaction.attributes).toMatchObject({
+      'dsh.compaction.incomplete': true,
+      'dsh.incomplete_reason': 'seed-boundary',
+      'dsh.force_ended': true,
+    })
+    expect(compaction.attributes['dsh.compaction.error']).toContain('session/end-seed')
+  })
+
+  it('aggregates human inputs and requires opt-in for plugin context', () => {
+    folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    folder.fold(ledger('user/message', 2, 1_010, {
+      role: 'user', content: [{ type: 'text', text: 'first' }], source: { kind: 'user' },
+    }))
+    folder.fold(ledger('user/message', 3, 1_020, {
+      role: 'user', content: [{ type: 'text', text: 'plugin context' }], source: { kind: 'plugin', plugin: 'context' },
+    }))
+    folder.fold(ledger('user/message', 4, 1_030, {
+      role: 'user', content: [{ type: 'text', text: 'second' }], source: { kind: 'user' },
+    }))
+    folder.fold(ledger('turn/end', 5, 1_040, { turn: 1, reason: { kind: 'completed' } }))
+    const input = spansByName().get('turn 1')!.attributes['langfuse.observation.input'] as string
+    expect(input).toContain('first')
+    expect(input).toContain('second')
+    expect(input).not.toContain('plugin context')
+
+    const contextExporter = new InMemorySpanExporter()
+    const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(contextExporter)] })
+    const contextFolder = new SessionSpanFolder(provider.getTracer('test'), {
+      content: { turnInputMode: 'user-and-context' },
+    })
+    contextFolder.fold(ledger('turn/start', 10, 2_000, { turn: 2 }))
+    contextFolder.fold(ledger('user/message', 11, 2_010, {
+      role: 'user', content: [{ type: 'text', text: 'included context' }], source: { kind: 'plugin', plugin: 'context' },
+    }))
+    contextFolder.fold(ledger('turn/end', 12, 2_020, { turn: 2, reason: { kind: 'completed' } }))
+    expect(contextExporter.getFinishedSpans().find(span => span.name === 'turn 2')!
+      .attributes['langfuse.observation.input']).toContain('included context')
+  })
+
+  it('applies session naming, safe cwd, environment, and tags to every observation', () => {
+    const metadataExporter = new InMemorySpanExporter()
+    const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(metadataExporter)] })
+    const metadataFolder = new SessionSpanFolder(provider.getTracer('test'), {
+      content: { cwdMode: 'basename' },
+      metadata: { environment: 'staging', tags: ['dsh', 'canary'] },
+    })
+    metadataFolder.fold(ledger('agent-preset/selected', 1, 900, { agentPreset: 'minimal' }))
+    metadataFolder.fold(ledger('subagent/descriptor', 2, 910, { label: 'research child' }))
+    metadataFolder.fold(ledger('turn/start', 3, 1_000, { turn: 1 }, 'info', {
+      'session.cwd': '/workspace/private/project-a',
+    }))
+    metadataFolder.fold(ledger('step/start', 4, 1_010, { turn: 1, step: 1 }))
+    metadataFolder.fold(ledger('session/title', 5, 1_020, { title: 'Final title' }))
+    metadataFolder.fold(ledger('step/end', 6, 1_030, { turn: 1, step: 1 }))
+    metadataFolder.fold(ledger('turn/end', 7, 1_040, { turn: 1, reason: { kind: 'completed' } }))
+
+    const spans = metadataExporter.getFinishedSpans()
+    for (const span of spans) {
+      expect(span.attributes).toMatchObject({
+        'langfuse.trace.name': 'Final title · turn 1',
+        'langfuse.environment': 'staging',
+        'langfuse.trace.tags': ['dsh', 'canary'],
+        'dsh.session.cwd': 'project-a',
+        'langfuse.trace.metadata.dsh_cwd': 'project-a',
+        'langfuse.trace.metadata.dsh_agent_preset': 'minimal',
+        'langfuse.trace.metadata.dsh_subagent_label': 'research child',
+      })
+    }
+    expect(spans.find(span => span.name === 'turn 1')!.name).toBe('turn 1')
+    expect(JSON.stringify(spans[0]!.attributes)).not.toContain('/workspace/private')
+  })
+
+  it('exports structured tool errors and only allowlisted tool metadata', () => {
+    const metadataExporter = new InMemorySpanExporter()
+    const provider = new BasicTracerProvider({ spanProcessors: [new SimpleSpanProcessor(metadataExporter)] })
+    const metadataFolder = new SessionSpanFolder(provider.getTracer('test'), {
+      content: { toolMetaAllowlist: ['safe', 'nested'] },
+    })
+    metadataFolder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
+    metadataFolder.fold(ledger('tool/call', 2, 1_010, {
+      turn: 1, step: 1, callId: 'call-1', name: 'bash', arguments: '{}',
+    }))
+    metadataFolder.fold(ledger('tool/result', 3, 1_020, {
+      turn: 1,
+      step: 1,
+      message: { role: 'user', content: [{
+        type: 'tool-result', toolCallId: 'call-1', content: [{ type: 'text', text: 'denied' }], isError: true,
+      }] },
+      error: { name: 'ToolExecutionError', code: 'PERMISSION_DENIED' },
+      meta: { safe: 'visible', nested: { count: 2 }, secret: 'hidden' },
+    }, 'error'))
+    metadataFolder.fold(ledger('turn/end', 4, 1_030, { turn: 1, reason: { kind: 'completed' } }))
+
+    const tool = metadataExporter.getFinishedSpans().find(span => span.name === 'tool bash')!
+    expect(tool.attributes).toMatchObject({
+      'dsh.tool.error.name': 'ToolExecutionError',
+      'dsh.tool.error.code': 'PERMISSION_DENIED',
+      'dsh.tool.outcome': 'error',
+      'langfuse.observation.metadata.tool.safe': '"visible"',
+      'langfuse.observation.metadata.tool.nested': '{"count":2}',
+    })
+    expect(JSON.stringify(tool.attributes)).not.toContain('hidden')
+  })
 })

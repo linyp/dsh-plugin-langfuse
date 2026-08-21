@@ -36,6 +36,7 @@ describe('config validation', () => {
     expect(DEFAULT_TELEMETRY_MODE).toBe(LangfuseTelemetryMode.DISABLED)
     const backend = construct({})
     expect(backend.sharing).toBe('disabled')
+    expect(backend.status()).toMatchObject({ state: 'disabled', traces: { state: 'disabled' }, scores: { state: 'disabled' } })
   })
 
   it('does not inspect Score transport config when the entire plugin is DISABLED', () => {
@@ -174,6 +175,40 @@ describe('config validation', () => {
       exporter: { url: URL_OK },
       correlation: correlation as unknown as Config['correlation'],
     })).toThrow(/correlation must be an object/)
+  })
+
+  it.each([-1, Number.POSITIVE_INFINITY])('rejects invalid health.warningIntervalMillis %j', (warningIntervalMillis) => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.DISABLED,
+      health: { warningIntervalMillis },
+    })).toThrow(/health\.warningIntervalMillis/)
+  })
+
+  it.each([0, 31, 1.5])('rejects invalid health.maxErrorChars %j', (maxErrorChars) => {
+    expect(() => construct({
+      mode: LangfuseTelemetryMode.DISABLED,
+      health: { maxErrorChars },
+    })).toThrow(/health\.maxErrorChars/)
+  })
+
+  it('rejects unknown content modes and unsafe tool metadata allowlists', () => {
+    const base = { mode: LangfuseTelemetryMode.FULL, auth: AUTH, exporter: { url: URL_OK } } as const
+    expect(() => construct({ ...base, content: { turnInputMode: 'everything' as never } }))
+      .toThrow(/content\.turnInputMode/)
+    expect(() => construct({ ...base, content: { cwdMode: 'relative' as never } }))
+      .toThrow(/content\.cwdMode/)
+    expect(() => construct({ ...base, content: { toolMetaAllowlist: [''] } }))
+      .toThrow(/toolMetaAllowlist/)
+  })
+
+  it('enforces Langfuse environment and tag bounds', () => {
+    const base = { mode: LangfuseTelemetryMode.FULL, auth: AUTH, exporter: { url: URL_OK } } as const
+    expect(() => construct({ ...base, metadata: { environment: 'Production' } }))
+      .toThrow(/metadata\.environment/)
+    expect(() => construct({ ...base, metadata: { environment: 'langfuse-test' } }))
+      .toThrow(/metadata\.environment/)
+    expect(() => construct({ ...base, metadata: { tags: ['x'.repeat(201)] } }))
+      .toThrow(/metadata\.tags/)
   })
 })
 

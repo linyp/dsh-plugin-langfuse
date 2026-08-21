@@ -43,6 +43,16 @@ Or as an explicit `cordis.yml` row:
       url: https://cloud.langfuse.com/api/public/scores
       maxQueueSize: 256
       requestTimeoutMillis: 3000
+    content:                    # optional privacy/content controls
+      turnInputMode: user       # none | user | user-and-context
+      cwdMode: omit             # omit | basename | full
+      toolMetaAllowlist: []     # exact top-level tool-result meta keys
+    metadata:                   # optional static Langfuse grouping
+      environment: production
+      tags: [dsh]
+    health:
+      warningIntervalMillis: 60000
+      maxErrorChars: 1000
     processor: {}              # optional; passed verbatim to BatchSpanProcessor
     shutdownTimeoutMillis: 3000
 ```
@@ -56,11 +66,18 @@ Or as an explicit `cordis.yml` row:
 | `auth` | Langfuse project key pair, turned into the endpoint's Basic-auth header. Mutually exclusive with an explicit `exporter.headers` authorization; uploading modes require exactly one of the two. |
 | `correlation` | Host-identity correlation: `userId`/`sessionId` stamped as `langfuse.user.id`/`langfuse.session.id` on every exported span so an embedding host's traces and this plugin's group under one Langfuse user/session. See [Correlating with an embedding host](#correlating-with-an-embedding-host). |
 | `feedbackScores` | Optional session-level TEXT Score export for canonical `feedback/record` events. `enabled` defaults to `false`; `url` must be the full `…/api/public/scores` path. `maxQueueSize` defaults to 256 and `requestTimeoutMillis` to 3000. The bounded in-memory queue is failure-isolated from tracing and drains best-effort on shutdown. The bundled profile enables it when both project keys exist. |
+| `content` | Export-content policy. `turnInputMode` defaults to `user` (aggregate human messages only); `user-and-context` also includes plugin-injected context and `none` omits root input. `cwdMode` defaults to `omit`; `basename` exports only the final directory and `full` exports the full path. `toolMetaAllowlist` defaults empty and admits only named top-level `tool/result.meta` keys. |
+| `metadata` | Optional static Langfuse `environment` and `tags`, propagated to every observation for v4 querying. Environment follows Langfuse's lowercase `a-z0-9-_` format, must not start with `langfuse`, and is at most 40 characters; at most 50 tags of at most 200 characters each are accepted. |
+| `health` | Delivery diagnostics. `warningIntervalMillis` defaults to 60000 and rate-limits continuing failure warnings (`0` suppresses repeats after the first warning); `maxErrorChars` defaults to 1000 after credential/URL sanitization. These settings do not add retries or change SDK buffering. |
 | `processor` | Passed verbatim to `BatchSpanProcessor` (`scheduledDelayMillis`, `maxQueueSize`, `maxExportBatchSize`, …); batching, retry, and loss policy are the SDK's documented behavior. |
 | `maxAttributeChars` | Serialized-payload ceiling per span attribute (default 32768); longer payloads are clipped with an `…[clipped]` marker while the canonical session log keeps the full bytes. |
 | `shutdownTimeoutMillis` | Plugin-owned outer deadline on the SDK's shutdown drain (default 3000). |
 
-Misconfiguration fails loud at plugin load: a missing/malformed/non-http(s) exporter URL, missing credentials, ambiguous double auth, a non-positive `maxExportBatchSize` (the SDK would hang on shutdown), an invalid `correlation` shape or empty `correlation.userId`/`sessionId`, an enabled Score sink without a valid URL/queue/timeout, or an unknown `mode` all throw before any transport is constructed.
+Misconfiguration fails loud at plugin load: a missing/malformed/non-http(s) exporter URL, missing credentials, ambiguous double auth, a non-positive `maxExportBatchSize` (the SDK would hang on shutdown), invalid correlation/content/metadata/health settings, an enabled Score sink without a valid URL/queue/timeout, or an unknown `mode` all throw before any transport is constructed.
+
+### Delivery status
+
+`LangfuseSessionTelemetryBackend.status()` returns a synchronous detached snapshot with overall and per-channel state, trace batch/span success and failure counts, consecutive failures, recent timestamps, sanitized last error, and Score queued/delivered/dropped/skipped/failed counts. States are `disabled`, `starting`, `healthy`, `degraded`, and `stopped`; Score remains an independent channel. The OTel SDK does not expose `BatchSpanProcessor` queue depth, so `traces.queuedBySdk` is explicitly `unknown`. First failure, rate-limited continuing failure, and recovery are also logged without Authorization or Langfuse keys.
 
 ## Correlating with an embedding host
 
@@ -86,10 +103,14 @@ config:
 |---|---|
 | session (`session.id`) | session (`langfuse.session.id` on every exported observation/span) |
 | `turn/start` / `turn/end` | trace root observation (root span; error end reasons set span status ERROR) |
-| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** — model, provider, output, canonical `gen_ai.usage.*` tokens (input/output/cache-read/cache-creation/reasoning); the latest assistant message also becomes the root observation's overall output. Harness rc.8 interrupted partial output is retained and marks both observations with `dsh.assistant.interrupted=true` without classifying the interruption as an error |
+| `step/start` / `step/end` + `request/header` + `request/context` + `assistant/message` | **generation** — model, provider, safe request parameters/context window, output, canonical `gen_ai.usage.*` tokens (input/output/cache-read/cache-creation/reasoning); the latest assistant message also becomes the root observation's overall output. Harness rc.8 interrupted partial output is retained and marks both observations with `dsh.assistant.interrupted=true` without classifying the interruption as an error |
+| `llm/retry` / `llm/retry-started` | structured scheduled/started events on the existing generation, including retry id/attempt/policy/delay and clipped failure details; no synthetic generation is created because rc.8 provides no per-attempt usage lifecycle |
 | first `assistant/chunk` of a step | `langfuse.observation.completion_start_time` (time-to-first-token) |
-| `tool/call` + `tool/result` | tool span (arguments as input, result as output, `isError` → status ERROR) |
-| `user/message` | root observation input; deprecated trace input is retained for legacy evaluator compatibility |
+| `tool/call` + `tool/result` | tool span (arguments as input, the full result content array as output, structured error name/code/outcome, `isError` → status ERROR; private `meta` is omitted unless allowlisted) |
+| `approval/asked` + `approval/decided` | timed internal approval span under the corresponding tool when `callId` resolves, otherwise under the current generation/turn; incomplete approvals are force-closed as ERROR |
+| `user/message` | aggregate root observation input according to `content.turnInputMode`; deprecated trace input is retained for legacy evaluator compatibility |
+| `session/title` / `subagent/descriptor` / `agent-preset/selected` | session semantic state used to set `langfuse.trace.name` and safe browsing metadata on current/future observations without changing stable span names or IDs |
+| `session/end-seed` | closes compactions inherited without a matching end at the seed boundary and marks them incomplete/ERROR |
 | `feedback/record` | session-level `dsh_user_feedback` TEXT Score when `feedbackScores.enabled`; only the post-waterfall canonical text is eligible |
 | forked child session | independent child turn trace plus queryable parent/seed metadata; an OTel Link points to the completed parent turn when its in-process context is retained |
 | `agent-error` ops record | `agent-error` span event + status ERROR on the open turn |
@@ -165,7 +186,7 @@ npm run test:package           # npm pack + empty-consumer install/import + bund
 
 The e2e follows the official repository's REAL-composition pattern (`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`): the fixture `cordis.yml` loads the **built** `lib/index.js` — the same file a deployment loads — and assertions run against the wire, including a standalone compaction trace, not against internals.
 
-When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output, usage, per-observation correlation, parent/child metadata, standalone compaction identity/summary/usage, and the Scores API for feedback readback. Without keys, that test self-skips.
+When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output, usage, per-observation correlation, parent/child metadata, standalone compaction identity/summary/usage, and the Scores API for feedback readback. Without keys, that test self-skips. Set `LANGFUSE_REQUIRE_TOTAL_COST=1` to additionally require a finite positive `totalCost` for the current official `deepseek-v4-flash` step generations; `LANGFUSE_E2E_COST_MODEL` may select an isolated test alias with the same pricing. This is an opt-in validation of the test project's Langfuse model-pricing setup, never a price hard-coded by the plugin.
 
 ## Version compatibility
 
@@ -177,6 +198,7 @@ DeepSeek Harness is in developer preview with no compatibility promises; this pl
 | 0.2.x | 0.1.0-rc.6 |
 | 0.3.x | 0.1.0-rc.7 |
 | 0.4.x | 0.1.0-rc.8 |
+| 0.5.x | 0.1.0-rc.8 |
 
 The separate **Upstream compatibility canary** workflow resolves every `@deepseek-ai/*` dependency to its newest published version. Pull requests and `main` pushes are advisory; the weekly schedule and manual dispatch are strict and run typecheck, unit tests, build, REAL-composition e2e, and package smoke. Failed runs retain the resolved manifest and lockfile for reproduction.
 
@@ -186,6 +208,8 @@ The separate **Upstream compatibility canary** workflow resolves every `@deepsee
 - **OTel Link UI rendering is not guaranteed**: parent/seed metadata is the stable, API-queryable lineage contract; Langfuse may not render the Link as a clickable edge.
 - **No durable delivery** (decision 5): OTel batching and the Score queue are in memory, so a process crash can lose accepted-but-unflushed data.
 - **One backend per context**: running Langfuse *and* the official OTLP-logs backend simultaneously requires a multi-sink evolution of the upstream seam.
+- **Auxiliary LLM calls are not generations yet**: title/search request events lack a complete paired completion/failure/usage lifecycle, so 0.5.x does not fabricate observations for them.
+- **Out-of-turn generic events remain log-only**: title/preset/descriptor are retained as semantic state, but the plugin does not create a long-lived session trace or one trace per arbitrary point event.
 
 ## License
 

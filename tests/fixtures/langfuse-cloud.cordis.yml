@@ -36,6 +36,12 @@
       # sessionId is left to its dsh-session-id default so the readback can
       # keep querying traces by the driver-reported session ids.
       userId: dsh-plugin-langfuse-e2e
+    metadata:
+      environment: integration
+      tags:
+        - dsh
+        - e2e
+        - cloud
     processor:
       # Export promptly so the driver's dispose drains a short queue.
       scheduledDelayMillis: 100
@@ -46,7 +52,9 @@
     agents:
       - id: main
         provider: langfuse-mock
-        model: langfuse-mock
+        # Use a real priced model id while retaining the keyless mock adapter.
+        # LANGFUSE_REQUIRE_TOTAL_COST=1 turns Cloud E2E into a cost-enrichment gate.
+        model: !!js process.env.LANGFUSE_E2E_COST_MODEL ?? 'deepseek-v4-flash'
         cwd: !!js process.cwd()
     persona: 'Test the dsh-plugin-langfuse backend against Langfuse cloud.'
     workspaceContext: false

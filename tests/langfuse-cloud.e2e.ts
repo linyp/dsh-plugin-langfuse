@@ -18,6 +18,8 @@ import { SYNTHETIC_PARENT_SPAN_ID, createDshCompactionTraceId } from '../src/ide
 const PUBLIC_KEY = process.env.LANGFUSE_PUBLIC_KEY
 const SECRET_KEY = process.env.LANGFUSE_SECRET_KEY
 const HOST = (process.env.LANGFUSE_HOST ?? 'https://cloud.langfuse.com').replace(/\/$/, '')
+const REQUIRE_TOTAL_COST = /^(1|true|yes)$/iu.test(process.env.LANGFUSE_REQUIRE_TOTAL_COST ?? '')
+const CLOUD_STEP_MODEL = process.env.LANGFUSE_E2E_COST_MODEL ?? 'deepseek-v4-flash'
 
 const driver = fileURLToPath(new URL('./fixtures/langfuse-cloud-driver.ts', import.meta.url))
 const configPath = fileURLToPath(new URL('./fixtures/langfuse-cloud.cordis.yml', import.meta.url))
@@ -37,6 +39,9 @@ interface V2Observation {
   outputUsage?: number
   totalUsage?: number
   totalCost?: number | null
+  environment?: string
+  tags?: string[]
+  traceName?: string
   parentObservationId?: string | null
   sessionId?: string
   userId?: string
@@ -63,7 +68,7 @@ async function api<T>(path: string): Promise<T> {
   return await response.json() as T
 }
 
-describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse cloud round trip', () => {
+describe.skipIf(!PUBLIC_KEY || !SECRET_KEY)('Langfuse cloud round trip', () => {
   it('ingests the exported session and serves the trace tree back through the public API', { timeout: 300_000 }, async () => {
     const fromStartTime = new Date(Date.now() - 5_000).toISOString()
     let sessionIds: string[] = []
@@ -105,7 +110,7 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     let rows: V2Observation[] = []
     for (;;) {
       const params = new URLSearchParams({
-        fields: 'core,basic,io,metadata,model,usage',
+        fields: 'core,basic,io,metadata,model,usage,trace_context',
         userId: 'dsh-plugin-langfuse-e2e',
         fromStartTime,
         toStartTime: new Date(Date.now() + 1_000).toISOString(),
@@ -122,13 +127,20 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
         && row.sessionId === parentSessionId
         && row.name === 'turn 1')
       const childRoot = rows.find(row => row.isRootObservation === true && row.sessionId === childSessionId)
+      const costReady = !REQUIRE_TOTAL_COST || stepGenerations.every(row => (
+        typeof row.totalCost === 'number' && Number.isFinite(row.totalCost) && row.totalCost > 0
+      ))
       const ready = stepGenerations.length >= 2
-        && stepGenerations.every(row => row.model === 'langfuse-mock' && row.usageDetails !== undefined)
+        && stepGenerations.every(row => row.model === CLOUD_STEP_MODEL && row.usageDetails !== undefined)
+        && costReady
         && compaction?.usageDetails !== undefined
         && JSON.stringify(compaction.output).includes(compactionSummary)
         && rows.some(row => row.type === 'TOOL' && row.name === 'bash')
         && root?.input != null
         && root.output != null
+        && root.environment === 'integration'
+        && root.tags?.includes('cloud') === true
+        && root.traceName?.endsWith(' · turn 1') === true
         && childRoot?.metadata?.dsh_parent_session_id === parentSessionId
         && childRoot.metadata.dsh_parent_trace_id === root.traceId
       if (ready || Date.now() >= deadline) break
@@ -140,7 +152,7 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     // exclusive buckets: 16 total input = 11 uncached + 2 read + 3 created.
     const generations = rows.filter(row => row.type === 'GENERATION')
     const stepGenerations = generations.filter(row => row.name === 'step 1' || row.name === 'step 2')
-    for (const generation of stepGenerations) expect(generation.model).toBe('langfuse-mock')
+    for (const generation of stepGenerations) expect(generation.model).toBe(CLOUD_STEP_MODEL)
     const step1 = generations.find(row => row.name === 'step 1')
     expect(step1?.usageDetails).toMatchObject({
       input: 11,
@@ -162,6 +174,18 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     expect(step2?.inputUsage).toBe(7)
     expect(step2?.outputUsage).toBe(5)
     expect(step2?.totalUsage).toBe(12)
+
+    if (REQUIRE_TOTAL_COST) {
+      expect(stepGenerations.length).toBeGreaterThanOrEqual(2)
+      for (const generation of stepGenerations) {
+        expect(
+          generation.totalCost,
+          `Langfuse returned no totalCost for ${generation.name ?? 'step'} model ${CLOUD_STEP_MODEL}; configure matching model pricing in the test project or unset LANGFUSE_REQUIRE_TOTAL_COST`,
+        ).toEqual(expect.any(Number))
+        expect(Number.isFinite(generation.totalCost)).toBe(true)
+        expect(generation.totalCost!).toBeGreaterThan(0)
+      }
+    }
 
     // Standalone compaction is a first-class root Generation with its stable
     // deterministic trace identity, summary output, aggregate-only input,
@@ -213,6 +237,9 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
     expect(root, 'v4 root observation').toBeDefined()
     expect(root!.input, 'v4 root observation input').toBeDefined()
     expect(root!.output, 'v4 root observation output').toBeDefined()
+    expect(root).toMatchObject({ environment: 'integration' })
+    expect(root!.traceName).toMatch(/ · turn 1$/u)
+    expect(root!.tags).toEqual(expect.arrayContaining(['dsh', 'e2e', 'cloud']))
     const children = rows.filter(row => row.type === 'GENERATION' || row.type === 'TOOL')
     expect(children.length).toBeGreaterThan(0)
     for (const row of children) {
@@ -229,6 +256,7 @@ describe.skipIf(PUBLIC_KEY === undefined || SECRET_KEY === undefined)('Langfuse 
       dsh_parent_trace_id: root?.traceId,
     })
     expect(childRoot?.metadata?.dsh_seed_length).toEqual(expect.any(Number))
+    expect(childRoot).toMatchObject({ environment: 'integration', traceName: 'dsh turn 2' })
 
     // The current read API returns one typed `value` and a discriminated
     // session subject. Poll it separately because trace and Score ingestion

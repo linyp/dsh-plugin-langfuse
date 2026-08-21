@@ -13,6 +13,7 @@ import { once } from 'node:events'
 import { boot, resolveConfigPath } from '@deepseek-ai/dsh-app-boot'
 import { runFixtureTurn } from '@deepseek-ai/dsh-loader-smoke'
 import { recordFeedback } from '@deepseek-ai/dsh-command-feedback'
+import { CallId, createToolResultMessage } from '@deepseek-ai/dsh-llm'
 
 const configPath = process.argv[2]
 if (configPath === undefined) throw new Error('langfuse driver requires a config path')
@@ -55,7 +56,7 @@ try {
   recordFeedback(session, 'e2e feedback score')
   // Exercise the merge-extensible session vocabulary without taking a direct
   // dependency on the compaction plugin's release-candidate peer graph.
-  const appendExtensionEvent = session.append.bind(session) as unknown as (type: string, data: unknown) => void
+  const appendExtensionEvent = session.append.bind(session) as unknown as (type: string, data: unknown, options?: unknown) => void
   appendExtensionEvent('compaction/start', { compactionId: 'e2e-compaction', turn: null })
   appendExtensionEvent('compaction/summary', {
     compactionId: 'e2e-compaction',
@@ -71,8 +72,90 @@ try {
   // Exercise the real SessionStore fork path: inherited seed rows are not
   // re-emitted, while every live child row carries parent/seed attributes.
   const child = ctx.sessions.fork(session)
-  child.append('turn/start', { turn: 2 })
-  child.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+  const appendChildEvent = child.append.bind(child) as unknown as (type: string, data: unknown, options?: unknown) => void
+  appendChildEvent('agent-preset/selected', { agentPreset: 'diagnostic' })
+  appendChildEvent('subagent/descriptor', {
+    version: 2,
+    mode: 'continuable',
+    provider: 'langfuse-e2e',
+    label: 'diagnostic child',
+  })
+  appendChildEvent('session/title', {
+    title: 'E2E child trace',
+    messageSeqs: [],
+    source: { kind: 'user' },
+  })
+  appendChildEvent('turn/start', { turn: 2 })
+  appendChildEvent('step/start', { turn: 2, step: 1 })
+  appendChildEvent('request/header', {
+    header: {
+      config: {
+        provider: 'langfuse-mock',
+        model: 'langfuse-diagnostic',
+        maxTokens: 512,
+        temperature: 0.1,
+        reasoningEffort: 'off',
+      },
+    },
+    reason: 'change',
+  })
+  appendChildEvent('request/context', {
+    provider: 'langfuse-mock',
+    model: 'langfuse-diagnostic',
+    contextWindow: 16_384,
+  })
+  appendChildEvent('llm/retry', {
+    retryId: 'e2e-retry',
+    turn: 2,
+    step: 1,
+    provider: 'langfuse-mock',
+    mode: 'normal',
+    policyKey: 'e2e',
+    retry: 1,
+    maxRetries: 2,
+    delayMs: 25,
+    failure: { message: 'synthetic rate limit', code: 'RATE_LIMIT', status: 429 },
+  })
+  appendChildEvent('llm/retry-started', {
+    retryId: 'e2e-retry',
+    turn: 2,
+    step: 1,
+    retry: 1,
+  })
+  const callId = CallId('langfuse-e2e-diagnostic-call')
+  appendChildEvent('tool/call', {
+    turn: 2,
+    step: 1,
+    callId,
+    name: 'diagnostic',
+    arguments: JSON.stringify({ probe: true }),
+  })
+  appendChildEvent('approval/asked', {
+    id: 'langfuse-e2e-approval',
+    toolName: 'diagnostic',
+    callId,
+    reason: 'exercise approval telemetry',
+  })
+  appendChildEvent('approval/decided', {
+    id: 'langfuse-e2e-approval',
+    outcome: 'rejected',
+  })
+  appendChildEvent('tool/result', {
+    turn: 2,
+    step: 1,
+    message: createToolResultMessage({
+      callId,
+      content: [
+        { type: 'text', text: 'diagnostic first block' },
+        { type: 'text', text: 'diagnostic second block' },
+      ],
+      isError: true,
+    }),
+    error: { name: 'DiagnosticError', code: 'DIAGNOSTIC_REJECTED' },
+    meta: { safe: 'visible', secret: 'must-not-export' },
+  }, { surfaceOp: 'append' })
+  appendChildEvent('step/end', { turn: 2, step: 1 })
+  appendChildEvent('turn/end', { turn: 2, reason: { kind: 'completed' } })
 } finally {
   await ctx.fiber.dispose()
 }

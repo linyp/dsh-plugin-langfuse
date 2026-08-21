@@ -30,7 +30,9 @@
  * @module dsh-plugin-langfuse/projection
  */
 
+import { basename } from 'node:path'
 import {
+  SpanKind,
   SpanStatusCode,
   trace,
   type Context as OtelContext,
@@ -48,6 +50,9 @@ import {
 } from './identity.ts'
 import {
   ATTR_DSH_ASSISTANT_INTERRUPTED,
+  ATTR_DSH_APPROVAL_ID,
+  ATTR_DSH_APPROVAL_OUTCOME,
+  ATTR_DSH_APPROVAL_REASON,
   ATTR_DSH_COMPACTION_DURATION_SCOPE,
   ATTR_DSH_COMPACTION_ERROR,
   ATTR_DSH_COMPACTION_ID,
@@ -58,37 +63,63 @@ import {
   ATTR_DSH_COMPACTION_SHADOWED_TOKEN_COUNT,
   ATTR_DSH_COMPACTION_SOURCE_COMMAND_ID,
   ATTR_DSH_COMPACTION_SUMMARY_SEEN,
+  ATTR_DSH_COMPACTION_INCOMPLETE,
   ATTR_DSH_EVENT_SEQ,
   ATTR_DSH_FORCE_ENDED,
+  ATTR_DSH_INCOMPLETE_REASON,
   ATTR_DSH_LINEAGE_LINKED,
   ATTR_DSH_LINEAGE_PARENT_TRACE_ID,
   ATTR_DSH_LINK_TYPE,
+  ATTR_DSH_LLM_RETRY_ATTEMPT,
+  ATTR_DSH_LLM_RETRY_DELAY_MS,
+  ATTR_DSH_LLM_RETRY_FAILURE_CODE,
+  ATTR_DSH_LLM_RETRY_FAILURE_MESSAGE,
+  ATTR_DSH_LLM_RETRY_FAILURE_STATUS,
+  ATTR_DSH_LLM_RETRY_ID,
+  ATTR_DSH_LLM_RETRY_MODE,
+  ATTR_DSH_LLM_RETRY_POLICY_KEY,
+  ATTR_DSH_LLM_RETRY_PROVIDER,
   ATTR_DSH_SESSION_ID,
+  ATTR_DSH_SESSION_CWD,
   ATTR_DSH_SESSION_PARENT_ID,
   ATTR_DSH_SESSION_SEED_LENGTH,
   ATTR_DSH_STEP,
+  ATTR_DSH_REQUEST_CONTEXT_WINDOW,
+  ATTR_DSH_REQUEST_HEADER_REASON,
+  ATTR_DSH_REQUEST_REASONING_EFFORT,
   ATTR_DSH_TRACE_DETERMINISTIC_ID,
   ATTR_DSH_TRACE_LOGICAL_ROOT,
   ATTR_DSH_TURN,
   ATTR_DSH_TURN_END_REASON,
+  ATTR_DSH_TOOL_ERROR_CODE,
+  ATTR_DSH_TOOL_ERROR_NAME,
+  ATTR_DSH_TOOL_OUTCOME,
   ATTR_GEN_AI_PROVIDER_NAME,
   ATTR_GEN_AI_REQUEST_MAX_TOKENS,
   ATTR_GEN_AI_REQUEST_MODEL,
+  ATTR_GEN_AI_REQUEST_TEMPERATURE,
   ATTR_GEN_AI_TOOL_CALL_ID,
   ATTR_GEN_AI_TOOL_NAME,
   ATTR_LANGFUSE_COMPLETION_START_TIME,
+  ATTR_LANGFUSE_ENVIRONMENT,
   ATTR_LANGFUSE_INTERNAL_IS_APP_ROOT,
   ATTR_LANGFUSE_OBSERVATION_INPUT,
+  ATTR_LANGFUSE_OBSERVATION_METADATA,
+  ATTR_LANGFUSE_OBSERVATION_MODEL_PARAMETERS,
   ATTR_LANGFUSE_OBSERVATION_OUTPUT,
   ATTR_LANGFUSE_OBSERVATION_TYPE,
   ATTR_LANGFUSE_SESSION_ID,
   ATTR_LANGFUSE_TRACE_INPUT,
+  ATTR_LANGFUSE_TRACE_METADATA_DSH_AGENT_PRESET,
+  ATTR_LANGFUSE_TRACE_METADATA_DSH_CWD,
   ATTR_LANGFUSE_TRACE_METADATA_DSH_DETERMINISTIC_TRACE_ID,
   ATTR_LANGFUSE_TRACE_METADATA_DSH_PARENT_SESSION_ID,
   ATTR_LANGFUSE_TRACE_METADATA_DSH_PARENT_TRACE_ID,
   ATTR_LANGFUSE_TRACE_METADATA_DSH_SEED_LENGTH,
+  ATTR_LANGFUSE_TRACE_METADATA_DSH_SUBAGENT_LABEL,
   ATTR_LANGFUSE_TRACE_NAME,
   ATTR_LANGFUSE_TRACE_OUTPUT,
+  ATTR_LANGFUSE_TRACE_TAGS,
   ATTR_LANGFUSE_USER_ID,
 } from './semconv.ts'
 import { toGenAiUsageAttributes } from './usage.ts'
@@ -100,6 +131,9 @@ import { toGenAiUsageAttributes } from './usage.ts'
  * `maxAttributeChars` config field.
  */
 export const DEFAULT_MAX_ATTRIBUTE_CHARS = 32_768
+export const DEFAULT_MAX_SESSION_STATES = 2_048
+
+const MAX_TRACE_NAME_CHARS = 200
 
 /** Serialize a payload for a span attribute, clipped to `budget` characters. */
 function clip(value: unknown, budget: number): string {
@@ -130,6 +164,8 @@ interface TraceCorrelation {
 interface TraceIdentityAttributes {
   deterministicTraceId: string
 }
+
+type SpanAttributeMap = Record<string, string | number | boolean | string[]>
 
 /** Trace-wide identity every span carries for v4 per-observation queries. */
 function identityAttributes(
@@ -169,6 +205,37 @@ interface StepState {
   /** OTel context carrying the step span, parent for its tool children. */
   context: OtelContext
   sawFirstChunk: boolean
+}
+
+interface ToolState {
+  span: Span
+  context: OtelContext
+  callId: string
+  name: string
+}
+
+interface ApprovalState {
+  span: Span
+  id: string
+}
+
+interface TurnInputItem {
+  seq: number
+  type: 'user/message'
+  source: string
+  content: unknown
+}
+
+interface SessionSemanticState {
+  title?: string
+  descriptorLabel?: string
+  agentPreset?: string
+  cwd?: string
+  requestContext?: {
+    provider: string
+    model: string
+    contextWindow?: number
+  }
 }
 
 /** Minimal read-only contract consumed from merge-extensible compaction events. */
@@ -218,7 +285,10 @@ interface TurnState {
   turn: number
   steps: Map<number, StepState>
   /** Open tool spans keyed by the model-issued call id. */
-  tools: Map<string, Span>
+  tools: Map<string, ToolState>
+  approvals: Map<string, ApprovalState>
+  inputs: TurnInputItem[]
+  traceName: string
   /** The step currently between `step/start` and `step/end`, if any. */
   currentStep?: StepState
   /** Identity locked at `turn/start`; later records cannot change it. */
@@ -228,6 +298,7 @@ interface TurnState {
 }
 
 interface SessionState {
+  semantic: SessionSemanticState
   /** Latest `request/header` snapshot; names the model on generation spans. */
   header?: SessionEventMap['request/header']['header']
   turn?: TurnState
@@ -364,6 +435,25 @@ export interface SessionSpanFolderOptions {
   maxAttributeChars?: number
   correlation?: CorrelationConfig
   identityRegistry?: TelemetryIdentityRegistry
+  content?: ProjectionContentConfig
+  metadata?: ProjectionMetadataConfig
+  /** Unit-test seam; production keeps the internal default. */
+  maxSessionStates?: number
+  onWarning?: (message: string) => void
+}
+
+export type TurnInputMode = 'none' | 'user' | 'user-and-context'
+export type CwdMode = 'omit' | 'basename' | 'full'
+
+export interface ProjectionContentConfig {
+  turnInputMode?: TurnInputMode
+  cwdMode?: CwdMode
+  toolMetaAllowlist?: string[]
+}
+
+export interface ProjectionMetadataConfig {
+  environment?: string
+  tags?: string[]
 }
 
 /**
@@ -376,11 +466,26 @@ export class SessionSpanFolder {
   private readonly maxAttributeChars: number
   private readonly correlation: CorrelationConfig | undefined
   private readonly identityRegistry: TelemetryIdentityRegistry
+  private readonly turnInputMode: TurnInputMode
+  private readonly cwdMode: CwdMode
+  private readonly toolMetaAllowlist: ReadonlySet<string>
+  private readonly environment: string | undefined
+  private readonly tags: string[] | undefined
+  private readonly maxSessionStates: number
+  private readonly onWarning: ((message: string) => void) | undefined
+  private capacityWarned = false
 
   constructor(private readonly tracer: Tracer, options?: SessionSpanFolderOptions) {
     this.maxAttributeChars = options?.maxAttributeChars ?? DEFAULT_MAX_ATTRIBUTE_CHARS
     this.correlation = options?.correlation
     this.identityRegistry = options?.identityRegistry ?? new TelemetryIdentityRegistry()
+    this.turnInputMode = options?.content?.turnInputMode ?? 'user'
+    this.cwdMode = options?.content?.cwdMode ?? 'omit'
+    this.toolMetaAllowlist = new Set(options?.content?.toolMetaAllowlist ?? [])
+    this.environment = options?.metadata?.environment
+    this.tags = options?.metadata?.tags === undefined ? undefined : [...options.metadata.tags]
+    this.maxSessionStates = options?.maxSessionStates ?? DEFAULT_MAX_SESSION_STATES
+    this.onWarning = options?.onWarning
   }
 
   /**
@@ -403,6 +508,93 @@ export class SessionSpanFolder {
     return clip(value, this.maxAttributeChars)
   }
 
+  private clipText(value: string, budget = this.maxAttributeChars): string {
+    return value.length <= budget ? value : `${value.slice(0, Math.max(0, budget - 10))}…[clipped]`
+  }
+
+  private traceName(state: SessionState, turn: number): string {
+    const label = state.semantic.title ?? state.semantic.descriptorLabel ?? state.semantic.agentPreset
+    return label === undefined
+      ? `dsh turn ${turn}`
+      : this.clipText(`${label} · turn ${turn}`, MAX_TRACE_NAME_CHARS)
+  }
+
+  private traceWideAttributes(state: SessionState, traceName: string): SpanAttributeMap {
+    const cwd = this.projectCwd(state.semantic.cwd)
+    return {
+      [ATTR_LANGFUSE_TRACE_NAME]: traceName,
+      ...this.environment === undefined ? {} : { [ATTR_LANGFUSE_ENVIRONMENT]: this.environment },
+      ...this.tags === undefined ? {} : { [ATTR_LANGFUSE_TRACE_TAGS]: [...this.tags] },
+      ...cwd === undefined ? {} : {
+        [ATTR_DSH_SESSION_CWD]: cwd,
+        [ATTR_LANGFUSE_TRACE_METADATA_DSH_CWD]: cwd,
+      },
+      ...state.semantic.agentPreset === undefined ? {} : {
+        [ATTR_LANGFUSE_TRACE_METADATA_DSH_AGENT_PRESET]: state.semantic.agentPreset,
+      },
+      ...state.semantic.descriptorLabel === undefined ? {} : {
+        [ATTR_LANGFUSE_TRACE_METADATA_DSH_SUBAGENT_LABEL]: state.semantic.descriptorLabel,
+      },
+    }
+  }
+
+  private projectCwd(cwd: string | undefined): string | undefined {
+    if (cwd === undefined || this.cwdMode === 'omit') return undefined
+    return this.clipText(this.cwdMode === 'basename' ? basename(cwd) : cwd)
+  }
+
+  private rememberRecordState(state: SessionState, record: SessionTelemetryRecord): void {
+    const cwd = stringAttr(record.attributes['session.cwd'])
+    if (cwd !== undefined) state.semantic.cwd = cwd
+  }
+
+  private updateOpenTraceName(state: SessionState): void {
+    const turn = state.turn
+    if (turn === undefined) return
+    turn.traceName = this.traceName(state, turn.turn)
+    const attributes = this.traceWideAttributes(state, turn.traceName)
+    turn.span.setAttributes(attributes)
+    for (const step of turn.steps.values()) step.span.setAttributes(attributes)
+    for (const tool of turn.tools.values()) tool.span.setAttributes(attributes)
+    for (const approval of turn.approvals.values()) approval.span.setAttributes(attributes)
+  }
+
+  private stateFor(sessionId: string): SessionState {
+    const retained = this.sessions.get(sessionId)
+    if (retained !== undefined) {
+      this.sessions.delete(sessionId)
+      this.sessions.set(sessionId, retained)
+      return retained
+    }
+    const state: SessionState = { semantic: {}, compactions: new Map<string, CompactionState>() }
+    this.sessions.set(sessionId, state)
+    this.evictIdleSessions(sessionId)
+    return state
+  }
+
+  private evictIdleSessions(protectedId?: string): void {
+    while (this.sessions.size > this.maxSessionStates) {
+      let evicted = false
+      for (const [id, candidate] of this.sessions) {
+        if (id === protectedId) continue
+        if (candidate.turn !== undefined || candidate.compactions.size > 0) continue
+        this.sessions.delete(id)
+        evicted = true
+        break
+      }
+      if (evicted) continue
+      if (!this.capacityWarned) {
+        this.capacityWarned = true
+        try {
+          this.onWarning?.(`dsh-plugin-langfuse: session projection state exceeded ${this.maxSessionStates} entries because every retained session is active`)
+        } catch {
+          // Host logging cannot change projection behavior.
+        }
+      }
+      return
+    }
+  }
+
   /**
    * Fold one handed-over record into the span tree. Synchronous O(1) map
    * work plus SDK span calls (themselves queue pushes into the batch
@@ -415,10 +607,19 @@ export class SessionSpanFolder {
       return
     }
     const sessionId = String(record.attributes['session.id'])
-    const state = this.sessions.get(sessionId) ?? { compactions: new Map<string, CompactionState>() }
-    this.sessions.set(sessionId, state)
+    const state = this.stateFor(sessionId)
+    this.rememberRecordState(state, record)
     switch (record.attributes['event.type']) {
       case 'request/header': return this.foldRequestHeader(state, record)
+      case 'request/context': return this.foldRequestContext(state, record)
+      case 'session/end-seed': return this.foldSessionEndSeed(state, record)
+      case 'llm/retry': return this.foldRetry(state, record, false)
+      case 'llm/retry-started': return this.foldRetry(state, record, true)
+      case 'approval/asked': return this.foldApprovalAsked(state, record)
+      case 'approval/decided': return this.foldApprovalDecided(state, record)
+      case 'session/title': return this.foldSessionTitle(state, record)
+      case 'subagent/descriptor': return this.foldSubagentDescriptor(state, record)
+      case 'agent-preset/selected': return this.foldAgentPreset(state, record)
       case 'turn/start': return this.foldTurnStart(state, record, sessionId)
       case 'user/message': return this.foldUserMessage(state, record)
       case 'step/start': return this.foldStepStart(state, record)
@@ -437,13 +638,181 @@ export class SessionSpanFolder {
   }
 
   private foldRequestHeader(state: SessionState, record: SessionTelemetryRecord): void {
-    state.header = body<'request/header'>(record).header
+    const payload = body<'request/header'>(record)
+    state.header = payload.header
     // The header is appended inside its step before dispatch, so the step
     // span opened before it; stamp the model identity onto the open step now.
     const open = state.turn?.currentStep
     if (open === undefined) return
-    open.span.setAttribute(ATTR_GEN_AI_REQUEST_MODEL, state.header.config.model)
-    open.span.setAttribute(ATTR_GEN_AI_PROVIDER_NAME, state.header.config.provider)
+    open.span.setAttributes(this.requestAttributes(state, payload.reason))
+  }
+
+  private foldRequestContext(state: SessionState, record: SessionTelemetryRecord): void {
+    const value = objectBody(record)
+    const provider = nonEmptyString(value?.['provider'])
+    const model = nonEmptyString(value?.['model'])
+    if (provider === undefined || model === undefined) return this.foldPointEvent(state, record)
+    const contextWindow = nonNegativeInteger(value?.['contextWindow'])
+    state.semantic.requestContext = {
+      provider,
+      model,
+      ...contextWindow === undefined ? {} : { contextWindow },
+    }
+    const open = state.turn?.currentStep
+    if (open !== undefined) open.span.setAttributes(this.requestAttributes(state))
+  }
+
+  private requestAttributes(state: SessionState, reason?: string): SpanAttributeMap {
+    const config = state.header?.config
+    const context = state.semantic.requestContext
+    const contextMatches = config !== undefined
+      && context?.provider === config.provider
+      && context.model === config.model
+    const parameters = config === undefined ? undefined : {
+      ...config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort },
+      ...config.temperature === undefined ? {} : { temperature: config.temperature },
+      ...config.maxTokens === undefined ? {} : { maxTokens: config.maxTokens },
+    }
+    return {
+      ...config === undefined ? {} : {
+        [ATTR_GEN_AI_REQUEST_MODEL]: config.model,
+        [ATTR_GEN_AI_PROVIDER_NAME]: config.provider,
+        ...config.maxTokens === undefined ? {} : { [ATTR_GEN_AI_REQUEST_MAX_TOKENS]: config.maxTokens },
+        ...config.temperature === undefined ? {} : { [ATTR_GEN_AI_REQUEST_TEMPERATURE]: config.temperature },
+        ...config.reasoningEffort === undefined ? {} : {
+          [ATTR_DSH_REQUEST_REASONING_EFFORT]: String(config.reasoningEffort),
+        },
+        [ATTR_LANGFUSE_OBSERVATION_MODEL_PARAMETERS]: this.clip(parameters),
+      },
+      ...contextMatches && context?.contextWindow !== undefined ? {
+        [ATTR_DSH_REQUEST_CONTEXT_WINDOW]: context.contextWindow,
+      } : {},
+      ...reason === undefined ? {} : { [ATTR_DSH_REQUEST_HEADER_REASON]: reason },
+    }
+  }
+
+  private foldSessionEndSeed(state: SessionState, record: SessionTelemetryRecord): void {
+    this.endCompactions(state, record.time, true, 'seed-boundary')
+    this.evictIdleSessions()
+  }
+
+  private foldRetry(state: SessionState, record: SessionTelemetryRecord, started: boolean): void {
+    const value = objectBody(record)
+    if (value === undefined) return this.foldPointEvent(state, record)
+    const step = nonNegativeInteger(value['step'])
+    const target = step === undefined ? state.turn?.currentStep : state.turn?.steps.get(step)
+    if (target === undefined) return this.foldPointEvent(state, record)
+    const retryId = nonEmptyString(value['retryId'])
+    const retry = nonNegativeInteger(value['retry'])
+    const failure = typeof value['failure'] === 'object' && value['failure'] !== null && !Array.isArray(value['failure'])
+      ? value['failure'] as Record<string, unknown>
+      : undefined
+    const attributes: SpanAttributeMap = {
+      [ATTR_DSH_EVENT_SEQ]: Number(record.attributes['event.seq']),
+      ...retryId === undefined ? {} : { [ATTR_DSH_LLM_RETRY_ID]: retryId },
+      ...retry === undefined ? {} : { [ATTR_DSH_LLM_RETRY_ATTEMPT]: retry },
+      ...nonEmptyString(value['provider']) === undefined ? {} : {
+        [ATTR_DSH_LLM_RETRY_PROVIDER]: nonEmptyString(value['provider'])!,
+      },
+      ...nonEmptyString(value['mode']) === undefined ? {} : {
+        [ATTR_DSH_LLM_RETRY_MODE]: nonEmptyString(value['mode'])!,
+      },
+      ...nonEmptyString(value['policyKey']) === undefined ? {} : {
+        [ATTR_DSH_LLM_RETRY_POLICY_KEY]: nonEmptyString(value['policyKey'])!,
+      },
+      ...typeof value['delayMs'] !== 'number' || !Number.isFinite(value['delayMs']) ? {} : {
+        [ATTR_DSH_LLM_RETRY_DELAY_MS]: value['delayMs'],
+      },
+      ...nonEmptyString(failure?.['code']) === undefined ? {} : {
+        [ATTR_DSH_LLM_RETRY_FAILURE_CODE]: nonEmptyString(failure?.['code'])!,
+      },
+      ...nonEmptyString(failure?.['message']) === undefined ? {} : {
+        [ATTR_DSH_LLM_RETRY_FAILURE_MESSAGE]: this.clipText(nonEmptyString(failure?.['message'])!),
+      },
+      ...typeof failure?.['status'] !== 'number' ? {} : {
+        [ATTR_DSH_LLM_RETRY_FAILURE_STATUS]: failure['status'],
+      },
+    }
+    target.span.addEvent(started ? 'dsh.llm.retry.started' : 'dsh.llm.retry.scheduled', attributes, record.time)
+  }
+
+  private foldApprovalAsked(state: SessionState, record: SessionTelemetryRecord): void {
+    const value = objectBody(record)
+    const id = nonEmptyString(value?.['id'])
+    const toolName = nonEmptyString(value?.['toolName'])
+    const turn = state.turn
+    if (id === undefined || toolName === undefined || turn === undefined) return this.foldPointEvent(state, record)
+    const duplicate = turn.approvals.get(id)
+    if (duplicate !== undefined) {
+      duplicate.span.addEvent('dsh.approval.duplicate', { [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'] }, record.time)
+      return
+    }
+    const callId = nonEmptyString(value?.['callId'])
+    const parent = callId === undefined
+      ? turn.currentStep?.context ?? turn.context
+      : turn.tools.get(callId)?.context ?? turn.currentStep?.context ?? turn.context
+    const span = this.tracer.startSpan(`approval ${toolName}`, {
+      kind: SpanKind.INTERNAL,
+      startTime: record.time,
+      attributes: {
+        ...identityAttributes(turn.correlation, turn.identity),
+        ...this.traceWideAttributes(state, turn.traceName),
+        [ATTR_DSH_APPROVAL_ID]: id,
+        [ATTR_GEN_AI_TOOL_NAME]: toolName,
+        [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
+        ...callId === undefined ? {} : { [ATTR_GEN_AI_TOOL_CALL_ID]: callId },
+        ...nonEmptyString(value?.['reason']) === undefined ? {} : {
+          [ATTR_DSH_APPROVAL_REASON]: this.clipText(nonEmptyString(value?.['reason'])!),
+        },
+      },
+    }, parent)
+    turn.approvals.set(id, { span, id })
+  }
+
+  private foldApprovalDecided(state: SessionState, record: SessionTelemetryRecord): void {
+    const value = objectBody(record)
+    const id = nonEmptyString(value?.['id'])
+    const outcome = nonEmptyString(value?.['outcome'])
+    const turn = state.turn
+    if (id === undefined || outcome === undefined || turn === undefined) return this.foldPointEvent(state, record)
+    const approval = turn.approvals.get(id)
+    if (approval === undefined) {
+      const target = turn.currentStep?.span ?? turn.span
+      target.addEvent('dsh.approval.orphan_decision', {
+        [ATTR_DSH_APPROVAL_ID]: id,
+        [ATTR_DSH_APPROVAL_OUTCOME]: outcome,
+        [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
+      }, record.time)
+      return
+    }
+    approval.span.setAttributes({
+      [ATTR_DSH_APPROVAL_OUTCOME]: outcome,
+      [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
+    })
+    if (outcome === 'unavailable') approval.span.setStatus({ code: SpanStatusCode.ERROR, message: outcome })
+    approval.span.end(record.time)
+    turn.approvals.delete(id)
+  }
+
+  private foldSessionTitle(state: SessionState, record: SessionTelemetryRecord): void {
+    const title = nonEmptyString(objectBody(record)?.['title'])
+    if (title === undefined) return this.foldPointEvent(state, record)
+    state.semantic.title = this.clipText(title, MAX_TRACE_NAME_CHARS)
+    this.updateOpenTraceName(state)
+  }
+
+  private foldSubagentDescriptor(state: SessionState, record: SessionTelemetryRecord): void {
+    const label = nonEmptyString(objectBody(record)?.['label'])
+    if (label === undefined) return this.foldPointEvent(state, record)
+    state.semantic.descriptorLabel = this.clipText(label, MAX_TRACE_NAME_CHARS)
+    this.updateOpenTraceName(state)
+  }
+
+  private foldAgentPreset(state: SessionState, record: SessionTelemetryRecord): void {
+    const preset = nonEmptyString(objectBody(record)?.['agentPreset'])
+    if (preset === undefined) return this.foldPointEvent(state, record)
+    state.semantic.agentPreset = this.clipText(preset, MAX_TRACE_NAME_CHARS)
+    this.updateOpenTraceName(state)
   }
 
   private foldTurnStart(state: SessionState, record: SessionTelemetryRecord, sessionId: string): void {
@@ -463,6 +832,7 @@ export class SessionSpanFolder {
       tracestate: record.attributes[TRACESTATE_ATTRIBUTE],
     })
     const lineage = this.identityRegistry.resolveForkLink(sessionId)
+    const traceName = this.traceName(state, turn)
     const span = this.tracer.startSpan(`turn ${turn}`, {
       startTime: record.time,
       ...lineage?.parentSpanContext === undefined ? {} : {
@@ -480,7 +850,7 @@ export class SessionSpanFolder {
         [ATTR_DSH_SESSION_ID]: correlation.dshSessionId,
         [ATTR_DSH_TRACE_LOGICAL_ROOT]: true,
         [ATTR_LANGFUSE_INTERNAL_IS_APP_ROOT]: true,
-        [ATTR_LANGFUSE_TRACE_NAME]: `dsh turn ${turn}`,
+        ...this.traceWideAttributes(state, traceName),
         ...lineage === undefined ? {} : {
           [ATTR_DSH_LINEAGE_LINKED]: lineage.linked,
           ...lineage.parentId === undefined ? {} : {
@@ -507,6 +877,9 @@ export class SessionSpanFolder {
       turn,
       steps: new Map(),
       tools: new Map(),
+      approvals: new Map(),
+      inputs: [],
+      traceName,
       correlation,
       identity,
     }
@@ -517,8 +890,22 @@ export class SessionSpanFolder {
     // user/message immediately after compaction/summary. It is model-visible
     // context, but not a new human prompt and must not overwrite root input.
     if (isCompactionCheckpointMessage(record)) return
-    const input = this.clip(record.body)
-    state.turn?.span.setAttributes({
+    const turn = state.turn
+    if (turn === undefined || this.turnInputMode === 'none') return
+    const value = objectBody(record)
+    const source = typeof value?.['source'] === 'object' && value['source'] !== null && !Array.isArray(value['source'])
+      ? value['source'] as Record<string, unknown>
+      : undefined
+    const sourceKind = nonEmptyString(source?.['kind']) ?? (value?.['role'] === 'user' ? 'user' : 'unknown')
+    if (this.turnInputMode === 'user' && sourceKind !== 'user') return
+    turn.inputs.push({
+      seq: Number(record.attributes['event.seq']),
+      type: 'user/message',
+      source: sourceKind,
+      content: value?.['content'] ?? record.body,
+    })
+    const input = this.clip(turn.inputs)
+    turn.span.setAttributes({
       [ATTR_LANGFUSE_OBSERVATION_INPUT]: input,
       [ATTR_LANGFUSE_TRACE_INPUT]: input,
     })
@@ -532,13 +919,11 @@ export class SessionSpanFolder {
       attributes: {
         [ATTR_LANGFUSE_OBSERVATION_TYPE]: 'generation',
         ...identityAttributes(state.turn.correlation, state.turn.identity),
+        ...this.traceWideAttributes(state, state.turn.traceName),
         [ATTR_DSH_TURN]: turn,
         [ATTR_DSH_STEP]: step,
         [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
-        ...state.header === undefined ? {} : {
-          [ATTR_GEN_AI_REQUEST_MODEL]: state.header.config.model,
-          [ATTR_GEN_AI_PROVIDER_NAME]: state.header.config.provider,
-        },
+        ...this.requestAttributes(state),
       },
     }, state.turn.context)
     const stepState: StepState = {
@@ -593,6 +978,7 @@ export class SessionSpanFolder {
       attributes: {
         [ATTR_LANGFUSE_OBSERVATION_TYPE]: 'tool',
         ...identityAttributes(state.turn.correlation, state.turn.identity),
+        ...this.traceWideAttributes(state, state.turn.traceName),
         [ATTR_GEN_AI_TOOL_NAME]: name,
         [ATTR_GEN_AI_TOOL_CALL_ID]: String(callId),
         [ATTR_LANGFUSE_OBSERVATION_INPUT]: this.clip(args),
@@ -601,18 +987,49 @@ export class SessionSpanFolder {
         [ATTR_DSH_EVENT_SEQ]: record.attributes['event.seq'],
       },
     }, parent)
-    state.turn.tools.set(String(callId), span)
+    state.turn.tools.set(String(callId), {
+      span,
+      context: trace.setSpan(parent, span),
+      callId: String(callId),
+      name,
+    })
   }
 
   private foldToolResult(state: SessionState, record: SessionTelemetryRecord): void {
-    const { message } = body<'tool/result'>(record)
+    const { message, error, meta } = body<'tool/result'>(record)
     const callId = String(message.content[0].toolCallId)
-    const span = state.turn?.tools.get(callId)
-    if (span === undefined) return
-    span.setAttribute(ATTR_LANGFUSE_OBSERVATION_OUTPUT, this.clip(message.content[0].content))
-    if (record.severity === 'error') span.setStatus({ code: SpanStatusCode.ERROR })
-    span.end(record.time)
+    const tool = state.turn?.tools.get(callId)
+    if (tool === undefined) return
+    const isError = message.content[0].isError === true || record.severity === 'error'
+    const outcome = error?.code === 'TOOL_NOT_STARTED'
+      ? 'not-started'
+      : error?.code !== undefined && /abort|cancel|interrupt/iu.test(error.code)
+        ? 'interrupted'
+        : isError
+          ? 'error'
+          : 'success'
+    tool.span.setAttributes({
+      [ATTR_LANGFUSE_OBSERVATION_OUTPUT]: this.clip(message.content[0].content),
+      [ATTR_DSH_TOOL_OUTCOME]: outcome,
+      ...error?.name === undefined ? {} : { [ATTR_DSH_TOOL_ERROR_NAME]: error.name },
+      ...error?.code === undefined ? {} : { [ATTR_DSH_TOOL_ERROR_CODE]: error.code },
+      ...this.toolMetaAttributes(meta),
+    })
+    if (isError) tool.span.setStatus({ code: SpanStatusCode.ERROR, ...error?.code === undefined ? {} : { message: error.code } })
+    tool.span.end(record.time)
     state.turn?.tools.delete(callId)
+  }
+
+  private toolMetaAttributes(meta: unknown): SpanAttributeMap {
+    if (this.toolMetaAllowlist.size === 0 || typeof meta !== 'object' || meta === null || Array.isArray(meta)) return {}
+    const source = meta as Record<string, unknown>
+    const attributes: SpanAttributeMap = {}
+    for (const key of this.toolMetaAllowlist) {
+      if (!Object.hasOwn(source, key)) continue
+      const attributeKey = `${ATTR_LANGFUSE_OBSERVATION_METADATA}.tool.${key.replace(/[^a-zA-Z0-9_.-]/gu, '_')}`
+      attributes[attributeKey] = this.clip(source[key])
+    }
+    return attributes
   }
 
   private foldTurnEnd(state: SessionState, record: SessionTelemetryRecord): void {
@@ -672,7 +1089,6 @@ export class SessionSpanFolder {
         [ATTR_DSH_SESSION_ID]: sessionId,
         [ATTR_DSH_TRACE_LOGICAL_ROOT]: true,
         [ATTR_LANGFUSE_INTERNAL_IS_APP_ROOT]: true,
-        [ATTR_LANGFUSE_TRACE_NAME]: 'dsh compaction',
         ...parentId === undefined ? {} : {
           [ATTR_DSH_SESSION_PARENT_ID]: parentId,
           [ATTR_LANGFUSE_TRACE_METADATA_DSH_PARENT_SESSION_ID]: parentId,
@@ -689,6 +1105,7 @@ export class SessionSpanFolder {
       attributes: {
         [ATTR_LANGFUSE_OBSERVATION_TYPE]: 'generation',
         ...identityAttributes(correlation, identity),
+        ...this.traceWideAttributes(state, owner?.traceName ?? 'dsh compaction'),
         ...rootAttributes,
         [ATTR_DSH_COMPACTION_ID]: payload.compactionId,
         [ATTR_DSH_COMPACTION_DURATION_SCOPE]: 'transaction',
@@ -752,6 +1169,7 @@ export class SessionSpanFolder {
       compaction.span.setAttribute(ATTR_DSH_COMPACTION_SOURCE_COMMAND_ID, payload.sourceCommandId)
     }
     this.endCompaction(state, compaction, record.time, false, payload.error)
+    this.evictIdleSessions()
   }
 
   /** Pruning is instantaneous bookkeeping, so it stays a span event. */
@@ -789,24 +1207,35 @@ export class SessionSpanFolder {
     time: number,
     forced: boolean,
     error?: string,
+    incompleteReason?: string,
   ): void {
     state.compactions.delete(compaction.compactionId)
     compaction.span.setAttribute(ATTR_DSH_COMPACTION_SUMMARY_SEEN, compaction.sawSummary)
     if (forced) compaction.span.setAttribute(ATTR_DSH_FORCE_ENDED, true)
+    if (incompleteReason !== undefined) {
+      compaction.span.setAttributes({
+        [ATTR_DSH_COMPACTION_INCOMPLETE]: true,
+        [ATTR_DSH_INCOMPLETE_REASON]: incompleteReason,
+      })
+    }
 
     const incomplete = error === undefined && !compaction.sawSummary
     if (error !== undefined || incomplete || forced) {
       const message = error
-        ?? (forced ? 'compaction lifecycle force-ended before compaction/end' : 'compaction/end arrived before compaction/summary')
+        ?? (incompleteReason === 'seed-boundary'
+          ? 'compaction lifecycle inherited across session/end-seed without compaction/end'
+          : forced
+            ? 'compaction lifecycle force-ended before compaction/end'
+            : 'compaction/end arrived before compaction/summary')
       compaction.span.setAttribute(ATTR_DSH_COMPACTION_ERROR, this.clip(message))
       compaction.span.setStatus({ code: SpanStatusCode.ERROR, message })
     }
     compaction.span.end(time)
   }
 
-  private endCompactions(state: SessionState, time: number, forced: boolean): void {
+  private endCompactions(state: SessionState, time: number, forced: boolean, incompleteReason?: string): void {
     for (const compaction of [...state.compactions.values()]) {
-      this.endCompaction(state, compaction, time, forced)
+      this.endCompaction(state, compaction, time, forced, undefined, incompleteReason)
     }
   }
 
@@ -842,18 +1271,29 @@ export class SessionSpanFolder {
     const turn = state.turn
     if (turn === undefined) return
     this.endCompactions(state, time, forced)
+    for (const [, approval] of turn.approvals) {
+      if (forced) {
+        approval.span.setAttributes({
+          [ATTR_DSH_FORCE_ENDED]: true,
+          [ATTR_DSH_INCOMPLETE_REASON]: 'turn-ended',
+        })
+        approval.span.setStatus({ code: SpanStatusCode.ERROR, message: 'approval lifecycle ended with its turn' })
+      }
+      approval.span.end(time)
+    }
+    for (const [, tool] of turn.tools) {
+      if (forced) tool.span.setAttribute(ATTR_DSH_FORCE_ENDED, true)
+      tool.span.end(time)
+    }
     for (const [, stepState] of turn.steps) {
       if (forced) stepState.span.setAttribute(ATTR_DSH_FORCE_ENDED, true)
       stepState.span.end(time)
-    }
-    for (const [, span] of turn.tools) {
-      if (forced) span.setAttribute(ATTR_DSH_FORCE_ENDED, true)
-      span.end(time)
     }
     if (forced) turn.span.setAttribute(ATTR_DSH_FORCE_ENDED, true)
     turn.span.end(time)
     this.identityRegistry.completeTurn(turn.identity, { endSeq, forced })
     state.turn = undefined
+    this.evictIdleSessions()
   }
 
   /**

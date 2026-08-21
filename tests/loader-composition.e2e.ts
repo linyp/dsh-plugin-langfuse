@@ -10,7 +10,7 @@
  */
 
 import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { LOADER_SMOKE_TEST_TIMEOUT_MS, runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
@@ -35,6 +35,10 @@ interface OtlpSpan {
     attributes?: { key: string; value: Record<string, unknown> }[]
   }[]
   status?: { code?: number }
+  events?: {
+    name: string
+    attributes?: { key: string; value: Record<string, unknown> }[]
+  }[]
 }
 
 interface Capture {
@@ -62,6 +66,10 @@ interface ScoreBody {
 
 function attr(span: OtlpSpan, key: string): unknown {
   return span.attributes?.find(entry => entry.key === key)?.value
+}
+
+function eventAttr(event: NonNullable<OtlpSpan['events']>[number], key: string): unknown {
+  return event.attributes?.find(entry => entry.key === key)?.value
 }
 
 describe('dsh-plugin-langfuse REAL composition', () => {
@@ -125,6 +133,15 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         expect(attr(child, 'dsh.lineage.linked')).toEqual({ boolValue: true })
         expect(attr(child, 'langfuse.trace.metadata.dsh_parent_session_id')).toEqual({ stringValue: dshSessionId })
         expect(attr(child, 'langfuse.trace.metadata.dsh_parent_trace_id')).toEqual({ stringValue: turn.traceId })
+        expect(attr(child, 'langfuse.trace.name')).toEqual({ stringValue: 'E2E child trace · turn 2' })
+        expect(attr(child, 'langfuse.environment')).toEqual({ stringValue: 'integration' })
+        expect(attr(child, 'langfuse.trace.tags')).toEqual({
+          arrayValue: { values: [{ stringValue: 'dsh' }, { stringValue: 'e2e' }] },
+        })
+        expect(attr(child, 'dsh.session.cwd')).toEqual({ stringValue: basename(cwd) })
+        expect(attr(child, 'langfuse.trace.metadata.dsh_cwd')).toEqual({ stringValue: basename(cwd) })
+        expect(attr(child, 'langfuse.trace.metadata.dsh_agent_preset')).toEqual({ stringValue: 'diagnostic' })
+        expect(attr(child, 'langfuse.trace.metadata.dsh_subagent_label')).toEqual({ stringValue: 'diagnostic child' })
         expect(child.links).toHaveLength(1)
         expect(child.links?.[0]).toMatchObject({ traceId: turn.traceId, spanId: turn.spanId })
         const linkType = child.links?.[0]?.attributes?.find(entry => entry.key === 'dsh.link.type')?.value
@@ -145,10 +162,41 @@ describe('dsh-plugin-langfuse REAL composition', () => {
         expect(attr(secondGeneration, 'gen_ai.usage.reasoning.output_tokens')).toEqual({ intValue: 1 })
         expect(attr(secondGeneration, 'gen_ai.usage.reasoning_tokens')).toBeUndefined()
 
+        const diagnosticGeneration = spans.find(span => span.name === 'step 1' && span.traceId === child.traceId)!
+        expect(diagnosticGeneration.parentSpanId).toBe(child.spanId)
+        expect(attr(diagnosticGeneration, 'gen_ai.request.model')).toEqual({ stringValue: 'langfuse-diagnostic' })
+        expect(attr(diagnosticGeneration, 'gen_ai.request.max_tokens')).toEqual({ intValue: 512 })
+        expect(attr(diagnosticGeneration, 'gen_ai.request.temperature')).toEqual({ doubleValue: 0.1 })
+        expect(attr(diagnosticGeneration, 'dsh.request.context_window')).toEqual({ intValue: 16_384 })
+        expect(attr(diagnosticGeneration, 'langfuse.trace.name')).toEqual({ stringValue: 'E2E child trace · turn 2' })
+        expect(spans.filter(span => span.name === 'step 1' && span.traceId === child.traceId)).toHaveLength(1)
+        const retryScheduled = diagnosticGeneration.events?.find(event => event.name === 'dsh.llm.retry.scheduled')
+        expect(retryScheduled).toBeDefined()
+        expect(eventAttr(retryScheduled!, 'dsh.llm.retry.id')).toEqual({ stringValue: 'e2e-retry' })
+        expect(eventAttr(retryScheduled!, 'dsh.llm.retry.failure.code')).toEqual({ stringValue: 'RATE_LIMIT' })
+        expect(diagnosticGeneration.events?.some(event => event.name === 'dsh.llm.retry.started')).toBe(true)
+
         // The tool span nests under the generation whose model request called it.
         const tool = spans.find(span => span.name === 'tool bash')!
         expect(tool.parentSpanId).toBe(generation.spanId)
         expect(attr(tool, 'langfuse.observation.output')).toBeDefined()
+
+        const diagnosticTool = spans.find(span => span.name === 'tool diagnostic')!
+        expect(diagnosticTool.parentSpanId).toBe(diagnosticGeneration.spanId)
+        expect(attr(diagnosticTool, 'dsh.tool.outcome')).toEqual({ stringValue: 'error' })
+        expect(attr(diagnosticTool, 'dsh.tool.error.name')).toEqual({ stringValue: 'DiagnosticError' })
+        expect(attr(diagnosticTool, 'dsh.tool.error.code')).toEqual({ stringValue: 'DIAGNOSTIC_REJECTED' })
+        expect(attr(diagnosticTool, 'langfuse.observation.output')).toEqual(expect.objectContaining({
+          stringValue: expect.stringContaining('diagnostic second block'),
+        }))
+        expect(attr(diagnosticTool, 'langfuse.observation.metadata.tool.safe')).toEqual({ stringValue: '"visible"' })
+        expect(attr(diagnosticTool, 'langfuse.observation.metadata.tool.secret')).toBeUndefined()
+        expect(JSON.stringify(diagnosticTool.attributes)).not.toContain('must-not-export')
+
+        const approval = spans.find(span => span.name === 'approval diagnostic')!
+        expect(approval.parentSpanId).toBe(diagnosticTool.spanId)
+        expect(attr(approval, 'dsh.approval.outcome')).toEqual({ stringValue: 'rejected' })
+        expect(attr(approval, 'dsh.approval.reason')).toEqual({ stringValue: 'exercise approval telemetry' })
 
         // A compaction outside an open turn becomes a stable standalone trace
         // while retaining the same Langfuse correlation identity.
@@ -162,11 +210,11 @@ describe('dsh-plugin-langfuse REAL composition', () => {
 
         // Correlation identity rides every span on the wire — Langfuse v4
         // filters per observation, so the root-span stamp alone is not enough.
-        for (const span of [turn, generation, tool]) {
+        for (const span of [turn, generation, tool, child, diagnosticGeneration, diagnosticTool, approval]) {
           expect(attr(span, 'langfuse.session.id'), `${span.name} session`).toEqual({ stringValue: 'e2e-host-session' })
           expect(attr(span, 'langfuse.user.id'), `${span.name} user`).toEqual({ stringValue: 'e2e-host-user' })
           expect(attr(span, 'langfuse.trace.metadata.dsh_deterministic_trace_id'), `${span.name} deterministic id`)
-            .toEqual({ stringValue: turn.traceId })
+            .toEqual({ stringValue: span.traceId })
         }
 
         const scoreCapture = scoreCaptures[0]!

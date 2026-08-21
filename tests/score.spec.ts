@@ -263,14 +263,18 @@ describe('FeedbackScoreSink', () => {
       send: vi.fn(async () => {}),
       shutdown: vi.fn(async () => {}),
     }
-    const sink = new FeedbackScoreSink({ ...mapperOptions(), transport })
+    const onEvent = vi.fn()
+    const sink = new FeedbackScoreSink({ ...mapperOptions(), transport, onEvent })
 
     sink.accept(feedbackRecord())
     expect(transport.send).not.toHaveBeenCalled()
     expect(sink.queuedCount).toBe(1)
+    expect(onEvent).toHaveBeenCalledWith({ kind: 'queued' })
 
     await sink.shutdown()
     expect(transport.send).toHaveBeenCalledOnce()
+    expect(sink.deliveredCount).toBe(1)
+    expect(onEvent).toHaveBeenLastCalledWith({ kind: 'delivered' })
   })
 
   it('does not retry permanent 4xx failures', async () => {

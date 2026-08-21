@@ -70,6 +70,8 @@ try {
   const publicApi = await import(pathToFileURL(join(installedRoot, 'lib/index.js')).href)
   assert.equal(typeof publicApi.createDshTurnTraceId, 'function')
   assert.equal(typeof publicApi.FeedbackScoreSink, 'function')
+  assert.equal(typeof publicApi.TelemetryHealthTracker, 'function')
+  assert.equal(typeof publicApi.sanitizeTelemetryError, 'function')
 
   const patches = loadOverlayPatches('dsh-plugin-langfuse-package-smoke', join(installedRoot, 'cordis.patch.yml'))
   const warnings = []

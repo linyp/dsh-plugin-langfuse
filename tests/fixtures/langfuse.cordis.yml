@@ -35,6 +35,15 @@
     correlation:
       userId: e2e-host-user
       sessionId: e2e-host-session
+    content:
+      cwdMode: basename
+      toolMetaAllowlist:
+        - safe
+    metadata:
+      environment: integration
+      tags:
+        - dsh
+        - e2e
     processor:
       # Export promptly so the driver's dispose drains a short queue.
       scheduledDelayMillis: 100

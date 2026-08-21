@@ -28,9 +28,21 @@ import { APP_IDENTITY } from '@deepseek-ai/dsh-llm'
 import type { OTLPExporterNodeConfigBase } from '@opentelemetry/otlp-exporter-base'
 import type { BufferConfig } from '@opentelemetry/sdk-trace-base'
 import { TelemetryIdentityRegistry } from './identity-registry.ts'
+import {
+  DEFAULT_HEALTH_MAX_ERROR_CHARS,
+  DEFAULT_HEALTH_WARNING_INTERVAL_MILLIS,
+  TelemetryHealthTracker,
+  type LangfuseTelemetryStatus,
+} from './health.ts'
 import { buildBasicAuthHeader, buildTracerPipeline, type TracerPipeline } from './otel.ts'
 import { LangfuseTelemetryPipeline } from './pipeline.ts'
-import { DEFAULT_MAX_ATTRIBUTE_CHARS, SessionSpanFolder, type CorrelationConfig } from './projection.ts'
+import {
+  DEFAULT_MAX_ATTRIBUTE_CHARS,
+  SessionSpanFolder,
+  type CorrelationConfig,
+  type ProjectionContentConfig,
+  type ProjectionMetadataConfig,
+} from './projection.ts'
 import {
   DEFAULT_SCORE_QUEUE_SIZE,
   DEFAULT_SCORE_REQUEST_TIMEOUT_MILLIS,
@@ -38,7 +50,25 @@ import {
   LangfuseScoreHttpTransport,
 } from './score.ts'
 
-export { DEFAULT_MAX_ATTRIBUTE_CHARS, type CorrelationConfig }
+export {
+  DEFAULT_MAX_ATTRIBUTE_CHARS,
+  DEFAULT_MAX_SESSION_STATES,
+  type CorrelationConfig,
+  type CwdMode,
+  type ProjectionContentConfig,
+  type ProjectionMetadataConfig,
+  type TurnInputMode,
+} from './projection.ts'
+export {
+  DEFAULT_HEALTH_MAX_ERROR_CHARS,
+  DEFAULT_HEALTH_WARNING_INTERVAL_MILLIS,
+  TelemetryHealthTracker,
+  sanitizeTelemetryError,
+  type LangfuseTelemetryStatus,
+  type SanitizedTelemetryError,
+  type ScoreDeliveryEvent,
+  type TelemetryHealthState,
+} from './health.ts'
 export {
   createCompactionParentContext,
   createDshCompactionTraceId,
@@ -155,6 +185,17 @@ export interface Config {
     maxQueueSize?: number
     requestTimeoutMillis?: number
   }
+  /** Export/Score delivery diagnostics; all values are local-only. */
+  health?: {
+    /** Minimum interval between repeated OTLP failure warnings. */
+    warningIntervalMillis?: number
+    /** Maximum retained characters in a sanitized transport error message. */
+    maxErrorChars?: number
+  }
+  /** Privacy-sensitive content projection controls. */
+  content?: ProjectionContentConfig
+  /** Static Langfuse grouping metadata propagated to every observation. */
+  metadata?: ProjectionMetadataConfig
   /** Passed verbatim to `BatchSpanProcessor`; the SDK owns and documents these knobs. */
   processor?: BufferConfig
   /**
@@ -189,6 +230,19 @@ export const Config: z<Config> = z.object({
     maxQueueSize: z.number(),
     requestTimeoutMillis: z.number(),
   }),
+  health: z.object({
+    warningIntervalMillis: z.number(),
+    maxErrorChars: z.number(),
+  }),
+  content: z.object({
+    turnInputMode: z.union(['none', 'user', 'user-and-context']),
+    cwdMode: z.union(['omit', 'basename', 'full']),
+    toolMetaAllowlist: z.array(z.string()),
+  }),
+  metadata: z.object({
+    environment: z.string(),
+    tags: z.array(z.string()),
+  }),
   processor: z.any(),
   maxAttributeChars: z.number(),
   shutdownTimeoutMillis: z.number(),
@@ -215,14 +269,17 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
 
   private readonly directEmit: SessionTelemetrySink['emit']
   private readonly telemetryPipeline: LangfuseTelemetryPipeline | undefined
+  private readonly healthTracker: TelemetryHealthTracker
   private readonly shutdownTimeoutMillis: number
   override readonly sharing: SessionTelemetrySharingStatus
 
   constructor(ctx: Context, config: Config) {
     const mode = resolveMode(config.mode)
+    const health = validateHealth(config)
     super(ctx)
     this.sharing = sharingStatusFor(mode)
     if (mode === LangfuseTelemetryMode.DISABLED) {
+      this.healthTracker = new TelemetryHealthTracker({ enabled: false, scoresEnabled: false })
       this.directEmit = DROP_RECORD
       this.telemetryPipeline = undefined
       this.shutdownTimeoutMillis = DEFAULT_SHUTDOWN_TIMEOUT_MILLIS
@@ -250,6 +307,16 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
     const headers = withDefaultIngestionVersion(authHeaders)
     const correlation = validateCorrelation(config)
     const feedbackScores = validateFeedbackScores(config)
+    const content = validateContent(config)
+    const metadata = validateMetadata(config)
+    this.healthTracker = new TelemetryHealthTracker({
+      enabled: true,
+      scoresEnabled: feedbackScores !== undefined,
+      warningIntervalMillis: health.warningIntervalMillis,
+      maxErrorChars: health.maxErrorChars,
+      onWarning: message => ctx.logger.warn(message),
+      onInfo: message => ctx.logger.info(message),
+    })
     const batchSize = config.processor?.maxExportBatchSize
     if (batchSize !== undefined && (!Number.isInteger(batchSize) || batchSize < 1)) {
       throw new Error(`dsh-plugin-langfuse: processor.maxExportBatchSize must be a positive integer, got ${String(batchSize)}`)
@@ -275,11 +342,15 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
       },
       scopeName: 'dsh-plugin-langfuse',
       scopeVersion: version,
+      onExportResult: (success, spanCount, error) => this.healthTracker.observeTraceExport(success, spanCount, error),
     })
     const folder = new SessionSpanFolder(otelPipeline.tracer, {
       maxAttributeChars,
       correlation,
       identityRegistry,
+      content,
+      metadata,
+      onWarning: message => ctx.logger.warn(message),
     })
     const scoreSink = feedbackScores === undefined
       ? undefined
@@ -294,6 +365,7 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
           staticSessionId: correlation?.sessionId,
           maxQueueSize: feedbackScores.maxQueueSize,
           onWarning: message => ctx.logger.warn(message),
+          onEvent: event => this.healthTracker.observeScore(event),
         })
     const telemetryPipeline = new LangfuseTelemetryPipeline({
       folder,
@@ -334,6 +406,11 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
     this.directEmit(record)
   }
 
+  /** Return a detached, local-only delivery-health snapshot. */
+  status(): LangfuseTelemetryStatus {
+    return this.healthTracker.status()
+  }
+
   // The seam's optional flush() hint is deliberately NOT implemented, for the
   // same hazard the official OTel backend documents: the batch processor is
   // this pipeline's only flusher, and forwarding the hint would be the sole
@@ -350,7 +427,7 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
    */
   async shutdown(): Promise<void> {
     if (this.telemetryPipeline === undefined) return
-    const telemetryShutdown = this.telemetryPipeline.shutdown()
+    const telemetryShutdown = this.telemetryPipeline.shutdown().finally(() => this.healthTracker.markStopped())
     let timer: ReturnType<typeof setTimeout> | undefined
     const deadline = new Promise<never>((_resolve, reject) => {
       timer = setTimeout(() => {
@@ -369,6 +446,75 @@ interface ResolvedFeedbackScoresConfig {
   url: string
   maxQueueSize: number
   requestTimeoutMillis: number
+}
+
+interface ResolvedHealthConfig {
+  warningIntervalMillis: number
+  maxErrorChars: number
+}
+
+function validateContent(config: Config): ProjectionContentConfig | undefined {
+  const value = config.content
+  if (value === undefined) return undefined
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`dsh-plugin-langfuse: content must be an object, got ${JSON.stringify(value)}`)
+  }
+  const turnInputMode = value.turnInputMode ?? 'user'
+  if (turnInputMode !== 'none' && turnInputMode !== 'user' && turnInputMode !== 'user-and-context') {
+    throw new Error(`dsh-plugin-langfuse: content.turnInputMode must be none, user, or user-and-context, got ${JSON.stringify(turnInputMode)}`)
+  }
+  const cwdMode = value.cwdMode ?? 'omit'
+  if (cwdMode !== 'omit' && cwdMode !== 'basename' && cwdMode !== 'full') {
+    throw new Error(`dsh-plugin-langfuse: content.cwdMode must be omit, basename, or full, got ${JSON.stringify(cwdMode)}`)
+  }
+  const toolMetaAllowlist = value.toolMetaAllowlist ?? []
+  if (!Array.isArray(toolMetaAllowlist) || toolMetaAllowlist.length > 64
+    || toolMetaAllowlist.some(key => typeof key !== 'string' || key.length === 0 || key.length > 100)) {
+    throw new Error('dsh-plugin-langfuse: content.toolMetaAllowlist must contain at most 64 non-empty strings of at most 100 characters')
+  }
+  return { turnInputMode, cwdMode, toolMetaAllowlist: [...new Set(toolMetaAllowlist)] }
+}
+
+function validateMetadata(config: Config): ProjectionMetadataConfig | undefined {
+  const value = config.metadata
+  if (value === undefined) return undefined
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`dsh-plugin-langfuse: metadata must be an object, got ${JSON.stringify(value)}`)
+  }
+  const environment = value.environment
+  if (environment !== undefined && (
+    typeof environment !== 'string'
+    || environment.length > 40
+    || !/^(?!langfuse)[a-z0-9-_]+$/u.test(environment)
+  )) {
+    throw new Error(`dsh-plugin-langfuse: metadata.environment must match ^(?!langfuse)[a-z0-9-_]+$ and be at most 40 characters, got ${JSON.stringify(environment)}`)
+  }
+  const tags = value.tags ?? []
+  if (!Array.isArray(tags) || tags.length > 50
+    || tags.some(tag => typeof tag !== 'string' || tag.length === 0 || tag.length > 200)) {
+    throw new Error('dsh-plugin-langfuse: metadata.tags must contain at most 50 non-empty strings of at most 200 characters')
+  }
+  return {
+    ...environment === undefined ? {} : { environment },
+    ...tags.length === 0 ? {} : { tags: [...new Set(tags)] },
+  }
+}
+
+/** Validate local diagnostics independently from transport credentials. */
+function validateHealth(config: Config): ResolvedHealthConfig {
+  const value = config.health
+  if (value !== undefined && (value === null || typeof value !== 'object' || Array.isArray(value))) {
+    throw new Error(`dsh-plugin-langfuse: health must be an object, got ${JSON.stringify(value)}`)
+  }
+  const warningIntervalMillis = value?.warningIntervalMillis ?? DEFAULT_HEALTH_WARNING_INTERVAL_MILLIS
+  if (!Number.isFinite(warningIntervalMillis) || warningIntervalMillis < 0 || warningIntervalMillis > MAX_TIMER_DELAY_MILLIS) {
+    throw new Error(`dsh-plugin-langfuse: health.warningIntervalMillis must be a non-negative finite number no greater than ${MAX_TIMER_DELAY_MILLIS}, got ${String(warningIntervalMillis)}`)
+  }
+  const maxErrorChars = value?.maxErrorChars ?? DEFAULT_HEALTH_MAX_ERROR_CHARS
+  if (!Number.isSafeInteger(maxErrorChars) || maxErrorChars < 32) {
+    throw new Error(`dsh-plugin-langfuse: health.maxErrorChars must be a safe integer of at least 32, got ${String(maxErrorChars)}`)
+  }
+  return { warningIntervalMillis, maxErrorChars }
 }
 
 /** Validate the opt-in Score channel before constructing either transport. */

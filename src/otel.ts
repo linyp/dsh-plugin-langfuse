@@ -14,6 +14,7 @@ import type { OTLPExporterNodeConfigBase } from '@opentelemetry/otlp-exporter-ba
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http'
 import { resourceFromAttributes } from '@opentelemetry/resources'
 import { BasicTracerProvider, BatchSpanProcessor, type BufferConfig } from '@opentelemetry/sdk-trace-base'
+import { ObservedSpanExporter, type SpanExportObserver } from './observed-exporter.ts'
 
 /**
  * Build Langfuse's `Authorization` header value from a project key pair.
@@ -44,11 +45,16 @@ export function buildTracerPipeline(options: {
   resourceAttributes: Record<string, string>
   scopeName: string
   scopeVersion: string
+  onExportResult?: SpanExportObserver
 }): TracerPipeline {
+  const exporter = new OTLPTraceExporter(options.exporter)
+  const observedExporter = options.onExportResult === undefined
+    ? exporter
+    : new ObservedSpanExporter(exporter, options.onExportResult)
   const provider = new BasicTracerProvider({
     resource: resourceFromAttributes(options.resourceAttributes),
     spanProcessors: [
-      new BatchSpanProcessor(new OTLPTraceExporter(options.exporter), options.processor),
+      new BatchSpanProcessor(observedExporter, options.processor),
     ],
   })
   return { provider, tracer: provider.getTracer(options.scopeName, options.scopeVersion) }

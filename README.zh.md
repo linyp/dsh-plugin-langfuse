@@ -43,6 +43,16 @@ bundle 层和环境变量都在启动时读取：安装后必须重启已在运�
       url: https://cloud.langfuse.com/api/public/scores
       maxQueueSize: 256
       requestTimeoutMillis: 3000
+    content:                    # 可选：隐私/内容控制
+      turnInputMode: user       # none | user | user-and-context
+      cwdMode: omit             # omit | basename | full
+      toolMetaAllowlist: []     # 精确匹配 tool-result meta 顶层键
+    metadata:                   # 可选：Langfuse 静态分组
+      environment: production
+      tags: [dsh]
+    health:
+      warningIntervalMillis: 60000
+      maxErrorChars: 1000
     processor: {}              # 可选；原样透传给 BatchSpanProcessor
     shutdownTimeoutMillis: 3000
 ```
@@ -56,11 +66,18 @@ bundle 层和环境变量都在启动时读取：安装后必须重启已在运�
 | `auth` | Langfuse 项目密钥对，转换为端点的 Basic-auth 请求头。与显式的 `exporter.headers` authorization 互斥；上传模式要求两者恰好提供其一。 |
 | `correlation` | 宿主身份关联：`userId`/`sessionId` 以 `langfuse.user.id`/`langfuse.session.id` 盖在每个导出 span 上，让嵌入方宿主的 trace 和本插件的 trace 归入同一个 Langfuse user/session。见[与嵌入宿主关联](#与嵌入宿主关联)。 |
 | `feedbackScores` | 可选：把 canonical `feedback/record` 导出为 session-level TEXT Score。`enabled` 默认 `false`；`url` 必须是完整的 `…/api/public/scores` 路径。`maxQueueSize` 默认 256，`requestTimeoutMillis` 默认 3000。有界内存队列与 trace 故障隔离，并在 shutdown 时 best-effort 排空。bundle profile 在两个项目密钥都存在时启用它。 |
+| `content` | 导出内容策略。`turnInputMode` 默认 `user`（只聚合真人消息）；`user-and-context` 还包括插件注入上下文，`none` 省略根 input。`cwdMode` 默认 `omit`；`basename` 只导出末级目录，`full` 导出完整路径。`toolMetaAllowlist` 默认为空，只允许明确列出的 `tool/result.meta` 顶层键。 |
+| `metadata` | 可选的 Langfuse 静态 `environment` 与 `tags`，传播到每个 observation 以支持 v4 查询。environment 遵循 Langfuse 的小写 `a-z0-9-_` 格式、不能以 `langfuse` 开头且最长 40 字符；最多 50 个 tag，每个最长 200 字符。 |
+| `health` | 投递诊断。`warningIntervalMillis` 默认 60000，用于持续失败告警限频（`0` 表示首次告警后不再重复）；`maxErrorChars` 默认 1000，作用于凭据/URL 清洗后的错误文本。这些设置不会增加重试或改变 SDK 缓冲语义。 |
 | `processor` | 原样透传给 `BatchSpanProcessor`（`scheduledDelayMillis`、`maxQueueSize`、`maxExportBatchSize` 等）；批处理、重试、丢失策略均为 SDK 的文档化行为。 |
 | `maxAttributeChars` | 每个 span 属性的序列化 payload 上限（默认 32768）；超长部分以 `…[clipped]` 标记裁剪，canonical 会话日志保留完整字节。 |
 | `shutdownTimeoutMillis` | 插件持有的 SDK shutdown 排水外层截止时间（默认 3000）。 |
 
-错误配置在插件加载时即失败：exporter URL 缺失/畸形/非 http(s)、凭据缺失、双重鉴权歧义、非正的 `maxExportBatchSize`（SDK 会在 shutdown 时挂死）、非法的 `correlation` 结构或空的 `correlation.userId`/`sessionId`、启用 Score 却没有合法 URL/队列/超时、未知 `mode`，全部在构造任何传输之前抛出。
+错误配置在插件加载时即失败：exporter URL 缺失/畸形/非 http(s)、凭据缺失、双重鉴权歧义、非正的 `maxExportBatchSize`（SDK 会在 shutdown 时挂死）、非法的 correlation/content/metadata/health、启用 Score 却没有合法 URL/队列/超时、未知 `mode`，全部在构造任何传输之前抛出。
+
+### 投递状态
+
+`LangfuseSessionTelemetryBackend.status()` 同步返回脱离内部状态的快照：整体与分通道状态、trace 批次/span 成功失败数、连续失败数、最近时间、已清洗的最近错误，以及 Score 的 queued/delivered/dropped/skipped/failed 计数。状态包括 `disabled`、`starting`、`healthy`、`degraded`、`stopped`；Score 始终是独立通道。OTel SDK 不公开 `BatchSpanProcessor` 队列深度，因此 `traces.queuedBySdk` 明确为 `unknown`。首次失败、限频后的持续失败和恢复也会写日志，且不会带 Authorization 或 Langfuse key。
 
 ## 与嵌入宿主关联
 
@@ -86,10 +103,14 @@ config:
 |---|---|
 | session（`session.id`） | session（每个导出的 observation/span 都带 `langfuse.session.id`） |
 | `turn/start` / `turn/end` | trace 根 observation（root span；错误结束原因置 span 状态为 ERROR） |
-| `step/start` / `step/end` + `request/header` + `assistant/message` | **generation** —— 模型、provider、输出、规范的 `gen_ai.usage.*` token（input/output/cache-read/cache-creation/reasoning）；最新一条 assistant message 同时成为根 observation 的整体输出。Harness rc.8 的中断输出会保留部分内容，并在两层 observation 标记 `dsh.assistant.interrupted=true`，但不会把中断误判为错误 |
+| `step/start` / `step/end` + `request/header` + `request/context` + `assistant/message` | **generation** —— 模型、provider、安全的请求参数/context window、输出、规范的 `gen_ai.usage.*` token（input/output/cache-read/cache-creation/reasoning）；最新一条 assistant message 同时成为根 observation 的整体输出。Harness rc.8 的中断输出会保留部分内容，并在两层 observation 标记 `dsh.assistant.interrupted=true`，但不会把中断误判为错误 |
+| `llm/retry` / `llm/retry-started` | 现有 generation 上的结构化 scheduled/started event，包含 retry id/attempt/policy/delay 与裁剪后的失败详情；rc.8 没有逐 attempt usage 生命周期，因此不伪造 generation |
 | step 的首个 `assistant/chunk` | `langfuse.observation.completion_start_time`（首 token 时间） |
-| `tool/call` + `tool/result` | tool span（参数为 input，结果为 output，`isError` → 状态 ERROR） |
-| `user/message` | 根 observation input；同时保留已弃用的 trace input，以兼容旧版 evaluator |
+| `tool/call` + `tool/result` | tool span（参数为 input，完整 result content 数组为 output，结构化 error name/code/outcome，`isError` → 状态 ERROR；私有 `meta` 除非 allowlist 明确允许，否则省略） |
+| `approval/asked` + `approval/decided` | 可计时的 approval 内部 span；`callId` 能解析时挂在对应 tool 下，否则挂在当前 generation/turn；未闭合审批强制以 ERROR 收尾 |
+| `user/message` | 按 `content.turnInputMode` 聚合为根 observation input；同时保留已弃用的 trace input，以兼容旧版 evaluator |
+| `session/title` / `subagent/descriptor` / `agent-preset/selected` | 会话语义状态，用于当前/后续 observation 的 `langfuse.trace.name` 与安全浏览 metadata，不改变稳定 span name 或 ID |
+| `session/end-seed` | 在 seed 边界关闭继承但缺少配对 end 的 compaction，并标记 incomplete/ERROR |
 | `feedback/record` | `feedbackScores.enabled` 时成为 session-level `dsh_user_feedback` TEXT Score；只有 canonical 且经过 waterfall 的文本有资格发送 |
 | fork child session | 独立的 child turn trace，并带可查询的 parent/seed metadata；进程内仍保留父 turn context 时附加指向它的 OTel Link |
 | `agent-error` ops 记录 | 开放 turn 上的 `agent-error` span event + 状态 ERROR |
@@ -165,7 +186,7 @@ npm run test:package           # npm pack + 空 consumer 安装/import + bundle 
 
 e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`）：fixture `cordis.yml` 加载**构建产物** `lib/index.js` —— 与部署加载的是同一个文件 —— 断言针对 wire（包括独立 compaction trace），而非内部实现。
 
-存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata、独立 compaction 的身份/摘要/usage，并通过 Scores API 回读 feedback；未提供密钥时该测试自行跳过。
+存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata、独立 compaction 的身份/摘要/usage，并通过 Scores API 回读 feedback；未提供密钥时该测试自行跳过。设置 `LANGFUSE_REQUIRE_TOTAL_COST=1` 后，还会要求当前官方 `deepseek-v4-flash` step generation 的 `totalCost` 为有限正数；`LANGFUSE_E2E_COST_MODEL` 可选择采用相同价格的隔离测试别名。这是对测试项目 Langfuse 模型计价配置的 opt-in 验证，插件本身不会硬编码价格。
 
 ## 版本兼容
 
@@ -177,6 +198,7 @@ DeepSeek Harness 处于 developer preview，无兼容承诺；本插件精确锁
 | 0.2.x | 0.1.0-rc.6 |
 | 0.3.x | 0.1.0-rc.7 |
 | 0.4.x | 0.1.0-rc.8 |
+| 0.5.x | 0.1.0-rc.8 |
 
 独立的 **Upstream compatibility canary** 工作流会把所有 `@deepseek-ai/*` 依赖解析到最新发布版本。Pull request 与 `main` push 只做预警；每周定时和手动触发严格失败，并依次运行 typecheck、单测、构建、REAL-composition e2e 与 package smoke。失败运行会保留解析后的 manifest 和 lockfile，便于复现。
 
@@ -186,6 +208,8 @@ DeepSeek Harness 处于 developer preview，无兼容承诺；本插件精确锁
 - **不保证 UI 渲染 OTel Link**：parent/seed metadata 是稳定且可通过 API 查询的 lineage 合约；Langfuse 未必把 Link 显示成可点击边。
 - **无持久化投递**（决策 5）：OTel batch 与 Score 队列都在内存中，进程崩溃可能丢失已接收但未 flush 的数据。
 - **每个 context 只能有一个后端**：同时运行 Langfuse 和官方 OTLP-logs 后端需要上游 seam 演进出 multi-sink。
+- **辅助 LLM 调用尚未映射为 generation**：title/search 请求事件缺少完整配对的 completion/failure/usage 生命周期，0.5.x 不会伪造 observation。
+- **通用轮次外事件仍仅留在日志**：title/preset/descriptor 会保留为语义状态，但插件不会创建长寿命 session trace，也不会为任意点事件逐条创建 trace。
 
 ## 许可证
 

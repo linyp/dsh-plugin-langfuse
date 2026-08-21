@@ -8,6 +8,7 @@
 
 import type { OTLPExporterNodeConfigBase } from '@opentelemetry/otlp-exporter-base'
 import type { SessionTelemetryRecord } from '@deepseek-ai/dsh-session-telemetry'
+import type { ScoreDeliveryEvent } from './health.ts'
 import { createDshFeedbackScoreId } from './identity.ts'
 import type { TelemetryIdentityRegistry } from './identity-registry.ts'
 
@@ -57,6 +58,7 @@ export interface FeedbackScoreSinkOptions extends FeedbackScoreMapperOptions {
   transport: ScoreTransport
   maxQueueSize?: number
   onWarning?: (message: string) => void
+  onEvent?: (event: ScoreDeliveryEvent) => void
   /** Test seam; production uses the bounded retry schedule above. */
   sleep?: (milliseconds: number) => Promise<void>
 }
@@ -198,6 +200,7 @@ export class FeedbackScoreSink {
   private readonly mapperOptions: FeedbackScoreMapperOptions
   private readonly maxQueueSize: number
   private readonly onWarning: ((message: string) => void) | undefined
+  private readonly onEvent: ((event: ScoreDeliveryEvent) => void) | undefined
   private readonly sleep: (milliseconds: number) => Promise<void>
   private readonly warned = new Set<string>()
   private worker: Promise<void> | undefined
@@ -206,6 +209,7 @@ export class FeedbackScoreSink {
   private _droppedCount = 0
   private _skippedCount = 0
   private _failedCount = 0
+  private _deliveredCount = 0
 
   constructor(options: FeedbackScoreSinkOptions) {
     const maxQueueSize = options.maxQueueSize ?? DEFAULT_SCORE_QUEUE_SIZE
@@ -224,6 +228,7 @@ export class FeedbackScoreSink {
     }
     this.maxQueueSize = maxQueueSize
     this.onWarning = options.onWarning
+    this.onEvent = options.onEvent
     this.sleep = options.sleep ?? delay
   }
 
@@ -233,19 +238,23 @@ export class FeedbackScoreSink {
       if (score === undefined) {
         if (record.channel === 'ledger' && record.attributes['event.type'] === 'feedback/record') {
           this._skippedCount += 1
+          this.notify({ kind: 'skipped', error: new Error('post-waterfall feedback record was empty or invalid') })
           this.warnOnce('invalid-record', 'dsh-plugin-langfuse: skipped a feedback Score because the post-waterfall record was empty or invalid')
         }
         return
       }
       if (this.closing || this.queue.length + (this.inFlight ? 1 : 0) >= this.maxQueueSize) {
         this._droppedCount += 1
+        this.notify({ kind: 'dropped', error: new Error('feedback Score queue is full') })
         this.warnOnce('queue-full', 'dsh-plugin-langfuse: feedback Score queue is full; dropping new Scores')
         return
       }
       this.queue.push(score)
+      this.notify({ kind: 'queued' })
       this.startWorker()
     } catch (error) {
       this._skippedCount += 1
+      this.notify({ kind: 'skipped', error })
       this.warnOnce('mapping-error', `dsh-plugin-langfuse: skipped a feedback Score after a mapping error: ${errorMessage(error)}`)
     }
   }
@@ -270,6 +279,10 @@ export class FeedbackScoreSink {
 
   get failedCount(): number {
     return this._failedCount
+  }
+
+  get deliveredCount(): number {
+    return this._deliveredCount
   }
 
   private startWorker(): void {
@@ -300,11 +313,14 @@ export class FeedbackScoreSink {
     for (let attempt = 1; attempt <= MAX_SCORE_ATTEMPTS; attempt += 1) {
       try {
         await this.transport.send(score)
+        this._deliveredCount += 1
+        this.notify({ kind: 'delivered' })
         return
       } catch (error) {
         const retriable = !(error instanceof ScoreTransportError) || error.retriable
         if (!retriable || attempt === MAX_SCORE_ATTEMPTS) {
           this._failedCount += 1
+          this.notify({ kind: 'failed', error })
           this.warnOnce('delivery-error', `dsh-plugin-langfuse: feedback Score delivery failed and was dropped: ${errorMessage(error)}`)
           return
         }
@@ -320,6 +336,14 @@ export class FeedbackScoreSink {
       this.onWarning?.(message)
     } catch {
       // Host logging cannot be allowed to break telemetry delivery.
+    }
+  }
+
+  private notify(event: ScoreDeliveryEvent): void {
+    try {
+      this.onEvent?.(event)
+    } catch {
+      // Diagnostics cannot be allowed to break Score delivery.
     }
   }
 }
