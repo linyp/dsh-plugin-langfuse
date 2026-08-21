@@ -36,8 +36,11 @@ try {
     'cordis.patch.yml',
     'README.md',
     'README.zh.md',
+    'lib/command.js',
     'lib/index.js',
+    'lib/types/command.d.ts',
     'lib/types/index.d.ts',
+    'src/command.ts',
     'src/index.ts',
   ]) assert(files.has(required), `packed artifact is missing ${required}`)
   for (const file of files) {
@@ -72,6 +75,9 @@ try {
   assert.equal(typeof publicApi.FeedbackScoreSink, 'function')
   assert.equal(typeof publicApi.TelemetryHealthTracker, 'function')
   assert.equal(typeof publicApi.sanitizeTelemetryError, 'function')
+  assert.equal(typeof publicApi.createLangfuseStatusReport, 'function')
+  assert.equal(typeof publicApi.executeLangfuseCommand, 'function')
+  assert.equal(typeof publicApi.formatLangfuseStatus, 'function')
 
   const patches = loadOverlayPatches('dsh-plugin-langfuse-package-smoke', join(installedRoot, 'cordis.patch.yml'))
   const warnings = []

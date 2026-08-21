@@ -17,6 +17,7 @@ import { createRequire } from 'node:module'
 import z from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-command-feedback'
+import type {} from '@deepseek-ai/dsh-commands'
 import {
   SessionTelemetryBackend,
   SessionTelemetryCoordinator,
@@ -49,6 +50,7 @@ import {
   FeedbackScoreSink,
   LangfuseScoreHttpTransport,
 } from './score.ts'
+import { installLangfuseStatusCommand } from './command.ts'
 
 export {
   DEFAULT_MAX_ATTRIBUTE_CHARS,
@@ -89,6 +91,14 @@ export {
   type ScoreTransport,
   type SessionTextScore,
 } from './score.ts'
+export {
+  LANGFUSE_STATUS_USAGE,
+  createLangfuseStatusReport,
+  executeLangfuseCommand,
+  formatLangfuseStatus,
+  type LangfuseStatusReport,
+  type LangfuseStatusSource,
+} from './command.ts'
 
 const { version } = createRequire(import.meta.url)('../package.json') as { version: string }
 
@@ -261,7 +271,9 @@ const MAX_TIMER_DELAY_MILLIS = 2_147_483_647
  * bundled `cordis.patch.yml`, which disables the base profile's OTLP-logs
  * row). Uploading modes wire the SDK pipeline and compose
  * {@link SessionTelemetryCoordinator}; `DISABLED` constructs no SDK state and
- * listens only to warn when recorded feedback stays local.
+ * listens only to warn when recorded feedback stays local. When the optional
+ * Harness commands service is composed, every mode also exposes the local-only
+ * `/langfuse status` diagnostic.
  */
 export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
   static inject = ['sessions']
@@ -286,6 +298,7 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
       ctx.on('session/event', (_session, event) => {
         if (event.type === 'feedback/record') ctx.logger.warn(DISABLED_FEEDBACK_WARNING)
       })
+      installLangfuseStatusCommand(ctx, this, version)
       return
     }
 
@@ -381,19 +394,20 @@ export class LangfuseSessionTelemetryBackend extends SessionTelemetryBackend {
     if (mode === LangfuseTelemetryMode.FULL) {
       this.directEmit = enqueue
       new SessionTelemetryCoordinator(ctx, backend, 'live')
-      return
+    } else {
+      this.directEmit = DROP_RECORD
+      const coordinator = new SessionTelemetryCoordinator(ctx, backend, 'on-demand')
+      ctx.on('session/event', (session, event) => {
+        if (event.type !== 'feedback/record') return
+        // Consent is the committed record, not an independently emitted bus value.
+        if (session.events[event.seq] !== event) {
+          ctx.logger.warn(NON_CANONICAL_FEEDBACK_WARNING)
+          return
+        }
+        coordinator.captureSession(session, event.seq)
+      })
     }
-    this.directEmit = DROP_RECORD
-    const coordinator = new SessionTelemetryCoordinator(ctx, backend, 'on-demand')
-    ctx.on('session/event', (session, event) => {
-      if (event.type !== 'feedback/record') return
-      // Consent is the committed record, not an independently emitted bus value.
-      if (session.events[event.seq] !== event) {
-        ctx.logger.warn(NON_CANONICAL_FEEDBACK_WARNING)
-        return
-      }
-      coordinator.captureSession(session, event.seq)
-    })
+    installLangfuseStatusCommand(ctx, this, version)
   }
 
   /**

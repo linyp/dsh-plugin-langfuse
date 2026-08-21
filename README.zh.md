@@ -79,6 +79,15 @@ bundle 层和环境变量都在启动时读取：安装后必须重启已在运�
 
 `LangfuseSessionTelemetryBackend.status()` 同步返回脱离内部状态的快照：整体与分通道状态、trace 批次/span 成功失败数、连续失败数、最近时间、已清洗的最近错误，以及 Score 的 queued/delivered/dropped/skipped/failed 计数。状态包括 `disabled`、`starting`、`healthy`、`degraded`、`stopped`；Score 始终是独立通道。OTel SDK 不公开 `BatchSpanProcessor` 队列深度，因此 `traces.queuedBySdk` 明确为 `unknown`。首次失败、限频后的持续失败和恢复也会写日志，且不会带 Authorization 或 Langfuse key。
 
+在标准 Harness 交互 profile 中，可以直接在对话界面查看同一份快照：
+
+```text
+/langfuse status
+/langfuse status --json
+```
+
+第一种格式适合人工阅读；`--json` 返回稳定 envelope，包含插件版本、会话分享策略和完整的 `status()` 快照。该命令只读本地状态：不会访问 Langfuse、重试投递、检查凭据或强制执行 SDK flush。只要 profile 组合了 Harness `commands` 服务（包括标准 `web` profile）就会注册该命令；未组合这一可选服务的纯 telemetry/headless context 仍能正常加载后端，只是不注册命令。`starting` 表示尚无 trace 导出批次完成，并不表示命令正在探测 endpoint。即使处于 `DISABLED` 模式，只要命令服务存在也会注册，因此可以用 `/langfuse status` 确认当前没有分享任何数据。
+
 ## 与嵌入宿主关联
 
 把 dsh 运行时嵌入自身、且已向同一 Langfuse 项目发送自有 trace 的宿主应用，可以操控本插件的身份标识，让两套视图归入同一个 Langfuse user/session——宿主通常在 spawn 运行时进程时以环境变量注入自己的 id：
@@ -177,7 +186,7 @@ seam 的记录与会话日志事件一一对应；Langfuse 需要 trace → obse
 ## 测试
 
 ```sh
-npm test                       # 单元：折叠投影 + 配置 fail-loud 路径
+npm test                       # 单元：status 命令 + 折叠投影 + 配置 fail-loud 路径
 npm run build && npm run test:e2e   # REAL composition：经 Loader 启动真实 dsh 应用
                                # （mock 模型 + 真实 bash 往返），断言 mock Langfuse
                                # collector 在 wire 上实际收到的 OTLP payload
@@ -186,7 +195,7 @@ npm run test:package           # npm pack + 空 consumer 安装/import + bundle 
 
 e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`）：fixture `cordis.yml` 加载**构建产物** `lib/index.js` —— 与部署加载的是同一个文件 —— 断言针对 wire（包括 retry payload、approval/tool-error metadata、完整独立 compaction 与 seed-boundary orphan compaction），而非内部实现。
 
-另一个本地 e2e 使用真实 `OTLPTraceExporter` 与 `BatchSpanProcessor`，依次触发 HTTP 503 和 200，并验证公开 backend status 从 degraded 恢复为 healthy；backend 单元测试还会独立锁定 observer 到 `status()` 的接线。
+status 命令测试覆盖人工/JSON 格式、严格参数处理、Harness 命令注册、`recordInput: false`、disabled 模式诊断，以及缺少可选命令服务的 headless 组合。另一个本地 e2e 使用真实 `OTLPTraceExporter` 与 `BatchSpanProcessor`，依次触发 HTTP 503 和 200，并验证公开 backend status 从 degraded 恢复为 healthy；backend 单元测试还会独立锁定 observer 到 `status()` 的接线。
 
 存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata、独立 compaction 的身份/摘要/usage、approval outcome 与结构化 tool error，并通过 Scores API 回读 feedback；它还会验证 retry 生命周期不会生成重复 generation。retry event payload 本身由本地 raw-OTLP wire 测试锁定，因为 Observations API 返回 observation，但不返回其内嵌的 OTel span event。未提供密钥时该测试自行跳过。设置 `LANGFUSE_REQUIRE_TOTAL_COST=1` 后，还会要求当前官方 `deepseek-v4-flash` step generation 的 `totalCost` 为有限正数；`LANGFUSE_E2E_COST_MODEL` 可选择采用相同价格的隔离测试别名。这是对测试项目 Langfuse 模型计价配置的 opt-in 验证，插件本身不会硬编码价格。
 

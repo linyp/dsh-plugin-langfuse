@@ -79,6 +79,15 @@ Misconfiguration fails loud at plugin load: a missing/malformed/non-http(s) expo
 
 `LangfuseSessionTelemetryBackend.status()` returns a synchronous detached snapshot with overall and per-channel state, trace batch/span success and failure counts, consecutive failures, recent timestamps, sanitized last error, and Score queued/delivered/dropped/skipped/failed counts. States are `disabled`, `starting`, `healthy`, `degraded`, and `stopped`; Score remains an independent channel. The OTel SDK does not expose `BatchSpanProcessor` queue depth, so `traces.queuedBySdk` is explicitly `unknown`. First failure, rate-limited continuing failure, and recovery are also logged without Authorization or Langfuse keys.
 
+In a standard interactive Harness profile, inspect the same snapshot without leaving the conversation UI:
+
+```text
+/langfuse status
+/langfuse status --json
+```
+
+The first form is a compact human-readable report; `--json` returns a stable envelope containing the plugin version, session-sharing policy, and the complete `status()` snapshot. The command is local-only: it does not contact Langfuse, retry delivery, inspect credentials, or force an SDK flush. It is available whenever the Harness `commands` service is composed (including the standard `web` profile); telemetry-only/headless compositions without that optional service continue to load the backend without registering the command. `starting` means no trace export batch has completed yet, not that the command is probing the endpoint. Even `DISABLED` mode registers the command when possible, so `/langfuse status` can confirm that nothing is being shared.
+
 ## Correlating with an embedding host
 
 A host application that embeds the dsh runtime and already emits its own traces into the same Langfuse project can steer this plugin's identity so both views group under one Langfuse user/session — the host typically injects its ids as env vars when spawning the runtime:
@@ -177,7 +186,7 @@ None; this plugin neither assembles nor sends a provider request.
 ## Testing
 
 ```sh
-npm test                       # unit: folding projection + config fail-loud paths
+npm test                       # unit: status command + folding projection + config fail-loud paths
 npm run build && npm run test:e2e   # REAL composition: boots a real dsh app via the
                                # Loader (mock model, real bash round trip) and asserts
                                # the OTLP payload a mock Langfuse collector received
@@ -186,7 +195,7 @@ npm run test:package           # npm pack + empty-consumer install/import + bund
 
 The e2e follows the official repository's REAL-composition pattern (`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`): the fixture `cordis.yml` loads the **built** `lib/index.js` — the same file a deployment loads — and assertions run against the wire, including retry payloads, approval/tool-error metadata, a complete standalone compaction, and a seed-boundary orphan compaction, not against internals.
 
-A separate local e2e drives the real `OTLPTraceExporter` and `BatchSpanProcessor` through an HTTP 503 followed by a 200 response and verifies the public backend status transition from degraded to healthy. The backend unit suite independently locks the observer-to-`status()` wiring.
+The status-command suite exercises human and JSON rendering, strict argument handling, Harness command registration, `recordInput: false`, disabled-mode diagnostics, and a headless composition without the optional command service. A separate local e2e drives the real `OTLPTraceExporter` and `BatchSpanProcessor` through an HTTP 503 followed by a 200 response and verifies the public backend status transition from degraded to healthy. The backend unit suite independently locks the observer-to-`status()` wiring.
 
 When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output, usage, per-observation correlation, parent/child metadata, standalone compaction identity/summary/usage, approval outcome, structured tool errors, and the Scores API for feedback readback. It also verifies that a retry lifecycle does not create a duplicate generation. The retry event payload itself is locked by the local raw-OTLP wire test because the Observations API returns the observation, not its embedded OTel span events. Without keys, that test self-skips. Set `LANGFUSE_REQUIRE_TOTAL_COST=1` to additionally require a finite positive `totalCost` for the current official `deepseek-v4-flash` step generations; `LANGFUSE_E2E_COST_MODEL` may select an isolated test alias with the same pricing. This is an opt-in validation of the test project's Langfuse model-pricing setup, never a price hard-coded by the plugin.
 
