@@ -112,8 +112,8 @@ config:
 |---|---|
 | session (`session.id`) | session (`langfuse.session.id` on every exported observation/span) |
 | `turn/start` / `turn/end` | trace root observation (root span; error end reasons set span status ERROR) |
-| `step/start` / `step/end` + `request/header` + `request/context` + `assistant/message` | **generation** — model, provider, safe request parameters/context window, output, canonical `gen_ai.usage.*` tokens (input/output/cache-read/cache-creation/reasoning); the latest assistant message also becomes the root observation's overall output. Harness rc.8 interrupted partial output is retained and marks both observations with `dsh.assistant.interrupted=true` without classifying the interruption as an error |
-| `llm/retry` / `llm/retry-started` | structured scheduled/started events on the existing generation, including retry id/attempt/policy/delay and clipped failure details; no synthetic generation is created because rc.8 provides no per-attempt usage lifecycle |
+| `step/start` / `step/end` + `request/header` + `request/context` + `assistant/message` | **generation** — model, provider, safe request parameters/context window, output, canonical `gen_ai.usage.*` tokens (input/output/cache-read/cache-creation/reasoning); the latest assistant message also becomes the root observation's overall output. Interrupted partial output is retained and marks both observations with `dsh.assistant.interrupted=true` without classifying the interruption as an error |
+| `llm/retry` / `llm/retry-started` | structured scheduled/started events on the existing generation, including retry id/attempt/policy/delay and clipped failure details; no synthetic generation is created because the current Harness event contract provides no per-attempt usage lifecycle |
 | first `assistant/chunk` of a step | `langfuse.observation.completion_start_time` (time-to-first-token) |
 | `tool/call` + `tool/result` | tool span (arguments as input, the full result content array as output, structured error name/code/outcome, `isError` → status ERROR; private `meta` is omitted unless allowlisted) |
 | `approval/asked` + `approval/decided` | timed internal approval span under the corresponding tool when `callId` resolves, otherwise under the current generation/turn; incomplete approvals are force-closed as ERROR |
@@ -190,6 +190,7 @@ npm test                       # unit: status command + folding projection + con
 npm run build && npm run test:e2e   # REAL composition: boots a real dsh app via the
                                # Loader (mock model, real bash round trip) and asserts
                                # the OTLP payload a mock Langfuse collector received
+npm run test:e2e:cloud         # opt-in real Langfuse round trip; loads credentials from .env
 npm run test:package           # npm pack + empty-consumer install/import + bundle composition
 ```
 
@@ -197,7 +198,7 @@ The e2e follows the official repository's REAL-composition pattern (`@deepseek-a
 
 The status-command suite exercises human and JSON rendering, strict argument handling, Harness command registration, `recordInput: false`, disabled-mode diagnostics, and a headless composition without the optional command service. A separate local e2e drives the real `OTLPTraceExporter` and `BatchSpanProcessor` through an HTTP 503 followed by a 200 response and verifies the public backend status transition from degraded to healthy. The backend unit suite independently locks the observer-to-`status()` wiring.
 
-When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are present, the same e2e command also runs a Cloud round trip and checks the v4 Observations API for root input/output, usage, per-observation correlation, parent/child metadata, standalone compaction identity/summary/usage, approval outcome, structured tool errors, and the Scores API for feedback readback. It also verifies that a retry lifecycle does not create a duplicate generation. The retry event payload itself is locked by the local raw-OTLP wire test because the Observations API returns the observation, not its embedded OTel span events. Without keys, that test self-skips. Set `LANGFUSE_REQUIRE_TOTAL_COST=1` to additionally require a finite positive `totalCost` for the current official `deepseek-v4-flash` step generations; `LANGFUSE_E2E_COST_MODEL` may select an isolated test alias with the same pricing. This is an opt-in validation of the test project's Langfuse model-pricing setup, never a price hard-coded by the plugin.
+`npm run test:e2e:cloud` loads the gitignored `.env` file and runs only the opt-in Langfuse Cloud round trip. Copy `.env.example` to `.env` and provide `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, and the matching regional `LANGFUSE_HOST`. The test checks the v4 Observations API for root input/output, usage, per-observation correlation, parent/child metadata, standalone compaction identity/summary/usage, approval outcome, structured tool errors, and the Scores API for feedback readback. It also verifies that a retry lifecycle does not create a duplicate generation. The retry event payload itself is locked by the local raw-OTLP wire test because the Observations API returns the observation, not its embedded OTel span events. The generic `npm run test:e2e` command still runs the Cloud case when those variables are already exported, and otherwise self-skips it. Set `LANGFUSE_REQUIRE_TOTAL_COST=1` to additionally require a finite positive `totalCost` for the current official `deepseek-v4-flash` step generations; `LANGFUSE_E2E_COST_MODEL` may select an isolated test alias with the same pricing. This is an opt-in validation of the test project's Langfuse model-pricing setup, never a price hard-coded by the plugin.
 
 ## Version compatibility
 
@@ -209,7 +210,8 @@ DeepSeek Harness is in developer preview with no compatibility promises; this pl
 | 0.2.x | 0.1.0-rc.6 |
 | 0.3.x | 0.1.0-rc.7 |
 | 0.4.x | 0.1.0-rc.8 |
-| 0.5.x | 0.1.0-rc.8 |
+| 0.5.0 | 0.1.0-rc.8 |
+| 0.5.1 | 0.1.1-rc.1 |
 
 The separate **Upstream compatibility canary** workflow resolves every `@deepseek-ai/*` dependency to its newest published version. Pull requests and `main` pushes are advisory; the weekly schedule and manual dispatch are strict and run typecheck, unit tests, build, REAL-composition e2e, and package smoke. Failed runs retain the resolved manifest and lockfile for reproduction.
 

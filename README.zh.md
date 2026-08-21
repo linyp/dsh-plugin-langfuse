@@ -112,8 +112,8 @@ config:
 |---|---|
 | session（`session.id`） | session（每个导出的 observation/span 都带 `langfuse.session.id`） |
 | `turn/start` / `turn/end` | trace 根 observation（root span；错误结束原因置 span 状态为 ERROR） |
-| `step/start` / `step/end` + `request/header` + `request/context` + `assistant/message` | **generation** —— 模型、provider、安全的请求参数/context window、输出、规范的 `gen_ai.usage.*` token（input/output/cache-read/cache-creation/reasoning）；最新一条 assistant message 同时成为根 observation 的整体输出。Harness rc.8 的中断输出会保留部分内容，并在两层 observation 标记 `dsh.assistant.interrupted=true`，但不会把中断误判为错误 |
-| `llm/retry` / `llm/retry-started` | 现有 generation 上的结构化 scheduled/started event，包含 retry id/attempt/policy/delay 与裁剪后的失败详情；rc.8 没有逐 attempt usage 生命周期，因此不伪造 generation |
+| `step/start` / `step/end` + `request/header` + `request/context` + `assistant/message` | **generation** —— 模型、provider、安全的请求参数/context window、输出、规范的 `gen_ai.usage.*` token（input/output/cache-read/cache-creation/reasoning）；最新一条 assistant message 同时成为根 observation 的整体输出。中断输出会保留部分内容，并在两层 observation 标记 `dsh.assistant.interrupted=true`，但不会把中断误判为错误 |
+| `llm/retry` / `llm/retry-started` | 现有 generation 上的结构化 scheduled/started event，包含 retry id/attempt/policy/delay 与裁剪后的失败详情；当前 Harness 事件合约没有逐 attempt usage 生命周期，因此不伪造 generation |
 | step 的首个 `assistant/chunk` | `langfuse.observation.completion_start_time`（首 token 时间） |
 | `tool/call` + `tool/result` | tool span（参数为 input，完整 result content 数组为 output，结构化 error name/code/outcome，`isError` → 状态 ERROR；私有 `meta` 除非 allowlist 明确允许，否则省略） |
 | `approval/asked` + `approval/decided` | 可计时的 approval 内部 span；`callId` 能解析时挂在对应 tool 下，否则挂在当前 generation/turn；未闭合审批强制以 ERROR 收尾 |
@@ -190,6 +190,7 @@ npm test                       # 单元：status 命令 + 折叠投影 + 配置 
 npm run build && npm run test:e2e   # REAL composition：经 Loader 启动真实 dsh 应用
                                # （mock 模型 + 真实 bash 往返），断言 mock Langfuse
                                # collector 在 wire 上实际收到的 OTLP payload
+npm run test:e2e:cloud         # opt-in 真实 Langfuse 往返；从 .env 加载凭据
 npm run test:package           # npm pack + 空 consumer 安装/import + bundle 组合
 ```
 
@@ -197,7 +198,7 @@ e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` 
 
 status 命令测试覆盖人工/JSON 格式、严格参数处理、Harness 命令注册、`recordInput: false`、disabled 模式诊断，以及缺少可选命令服务的 headless 组合。另一个本地 e2e 使用真实 `OTLPTraceExporter` 与 `BatchSpanProcessor`，依次触发 HTTP 503 和 200，并验证公开 backend status 从 degraded 恢复为 healthy；backend 单元测试还会独立锁定 observer 到 `status()` 的接线。
 
-存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata、独立 compaction 的身份/摘要/usage、approval outcome 与结构化 tool error，并通过 Scores API 回读 feedback；它还会验证 retry 生命周期不会生成重复 generation。retry event payload 本身由本地 raw-OTLP wire 测试锁定，因为 Observations API 返回 observation，但不返回其内嵌的 OTel span event。未提供密钥时该测试自行跳过。设置 `LANGFUSE_REQUIRE_TOTAL_COST=1` 后，还会要求当前官方 `deepseek-v4-flash` step generation 的 `totalCost` 为有限正数；`LANGFUSE_E2E_COST_MODEL` 可选择采用相同价格的隔离测试别名。这是对测试项目 Langfuse 模型计价配置的 opt-in 验证，插件本身不会硬编码价格。
+`npm run test:e2e:cloud` 会加载 gitignored 的 `.env`，并且只运行 opt-in 的 Langfuse Cloud 往返测试。先把 `.env.example` 复制为 `.env`，再填入 `LANGFUSE_PUBLIC_KEY`、`LANGFUSE_SECRET_KEY` 和匹配区域的 `LANGFUSE_HOST`。测试会通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata、独立 compaction 的身份/摘要/usage、approval outcome 与结构化 tool error，并通过 Scores API 回读 feedback；它还会验证 retry 生命周期不会生成重复 generation。retry event payload 本身由本地 raw-OTLP wire 测试锁定，因为 Observations API 返回 observation，但不返回其内嵌的 OTel span event。通用的 `npm run test:e2e` 在这些变量已导出时仍会执行 Cloud case，否则自行跳过。设置 `LANGFUSE_REQUIRE_TOTAL_COST=1` 后，还会要求当前官方 `deepseek-v4-flash` step generation 的 `totalCost` 为有限正数；`LANGFUSE_E2E_COST_MODEL` 可选择采用相同价格的隔离测试别名。这是对测试项目 Langfuse 模型计价配置的 opt-in 验证，插件本身不会硬编码价格。
 
 ## 版本兼容
 
@@ -209,7 +210,8 @@ DeepSeek Harness 处于 developer preview，无兼容承诺；本插件精确锁
 | 0.2.x | 0.1.0-rc.6 |
 | 0.3.x | 0.1.0-rc.7 |
 | 0.4.x | 0.1.0-rc.8 |
-| 0.5.x | 0.1.0-rc.8 |
+| 0.5.0 | 0.1.0-rc.8 |
+| 0.5.1 | 0.1.1-rc.1 |
 
 独立的 **Upstream compatibility canary** 工作流会把所有 `@deepseek-ai/*` 依赖解析到最新发布版本。Pull request 与 `main` push 只做预警；每周定时和手动触发严格失败，并依次运行 typecheck、单测、构建、REAL-composition e2e 与 package smoke。失败运行会保留解析后的 manifest 和 lockfile，便于复现。
 
