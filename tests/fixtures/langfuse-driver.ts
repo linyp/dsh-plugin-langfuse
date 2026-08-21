@@ -69,6 +69,10 @@ try {
     usage: { inputTokens: 8, outputTokens: 2 },
   })
   appendExtensionEvent('compaction/end', { compactionId: 'e2e-compaction', turn: null })
+  // A compaction inherited without its summary/end must close at the seed
+  // boundary even when no turn is open, rather than lingering until shutdown.
+  appendExtensionEvent('compaction/start', { compactionId: 'e2e-seed-orphan', turn: null })
+  appendExtensionEvent('session/end-seed', {})
   // Exercise the real SessionStore fork path: inherited seed rows are not
   // re-emitted, while every live child row carries parent/seed attributes.
   const child = ctx.sessions.fork(session)

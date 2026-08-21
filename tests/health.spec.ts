@@ -44,7 +44,7 @@ describe('TelemetryHealthTracker', () => {
     })
 
     expect(tracker.status().state).toBe('starting')
-    tracker.observeTraceExport(false, 3, Object.assign(new Error('HTTP 500'), { code: 'ECONNRESET' }))
+    tracker.observeTraceExport(false, 3, Object.assign(new Error('HTTP 429'), { code: 'RATE_LIMIT' }))
     expect(tracker.status()).toMatchObject({
       state: 'degraded',
       traces: {
@@ -52,15 +52,16 @@ describe('TelemetryHealthTracker', () => {
         failedSpans: 3,
         consecutiveFailures: 1,
         lastFailureAt: 1_000,
-        lastError: { name: 'Error', code: 'ECONNRESET', message: 'HTTP 500' },
+        lastError: { name: 'Error', code: 'RATE_LIMIT', message: 'HTTP 429' },
       },
     })
-    tracker.observeTraceExport(false, 2, new Error('HTTP 500 again'))
+    tracker.observeTraceExport(false, 2, new Error('HTTP 503'))
     expect(warning).toHaveBeenCalledOnce()
 
     now = 1_101
-    tracker.observeTraceExport(false, 1, new Error('HTTP 500 later'))
+    tracker.observeTraceExport(false, 1, Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }))
     expect(warning).toHaveBeenCalledTimes(2)
+    expect(tracker.status().traces.lastError).toMatchObject({ code: 'ECONNRESET', message: 'socket hang up' })
     tracker.observeTraceExport(true, 4)
 
     expect(tracker.status()).toMatchObject({

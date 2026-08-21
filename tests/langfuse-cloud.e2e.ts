@@ -33,6 +33,8 @@ interface V2Observation {
   traceId: string
   type?: string
   name?: string
+  level?: string
+  statusMessage?: string | null
   model?: string
   usageDetails?: Record<string, number>
   inputUsage?: number
@@ -66,6 +68,23 @@ async function api<T>(path: string): Promise<T> {
   })
   if (!response.ok) throw new Error(`Langfuse API ${path} responded ${response.status}: ${await response.text()}`)
   return await response.json() as T
+}
+
+function otelAttributes(observation: V2Observation | undefined): Record<string, unknown> {
+  const metadata = observation?.metadata
+  if (metadata === undefined) return {}
+  const nested = metadata.attributes
+  const attributes: Record<string, unknown> = nested !== null && typeof nested === 'object' && !Array.isArray(nested)
+    ? { ...nested as Record<string, unknown> }
+    : {}
+  // Langfuse Cloud v4 currently serializes the same catch-all object through
+  // Observations v2 as flat `metadata["attributes.<key>"]` entries. Accept
+  // both representations so this test locks semantics rather than one read
+  // API serialization detail.
+  for (const [key, value] of Object.entries(metadata)) {
+    if (key.startsWith('attributes.')) attributes[key.slice('attributes.'.length)] = value
+  }
+  return attributes
 }
 
 describe.skipIf(!PUBLIC_KEY || !SECRET_KEY)('Langfuse cloud round trip', () => {
@@ -119,7 +138,8 @@ describe.skipIf(!PUBLIC_KEY || !SECRET_KEY)('Langfuse cloud round trip', () => {
       const page = await api<{ data?: V2Observation[] }>(`/api/public/v2/observations?${params}`)
       rows = (page.data ?? []).filter(row => row.sessionId !== undefined && sessionIds.includes(row.sessionId))
       const generations = rows.filter(row => row.type === 'GENERATION')
-      const stepGenerations = generations.filter(row => row.name === 'step 1' || row.name === 'step 2')
+      const stepGenerations = generations.filter(row => row.sessionId === parentSessionId
+        && (row.name === 'step 1' || row.name === 'step 2'))
       const compaction = generations.find(row => row.name === 'compaction'
         && row.sessionId === parentSessionId
         && row.model === 'langfuse-compaction-mock')
@@ -127,6 +147,15 @@ describe.skipIf(!PUBLIC_KEY || !SECRET_KEY)('Langfuse cloud round trip', () => {
         && row.sessionId === parentSessionId
         && row.name === 'turn 1')
       const childRoot = rows.find(row => row.isRootObservation === true && row.sessionId === childSessionId)
+      const diagnosticGeneration = generations.find(row => row.sessionId === childSessionId && row.name === 'step 1')
+      const diagnosticTool = rows.find(row => row.sessionId === childSessionId
+        && row.type === 'TOOL'
+        && row.name === 'diagnostic'
+        && row.level === 'ERROR')
+      const approval = rows.find(row => row.sessionId === childSessionId
+        && row.type === 'SPAN'
+        && row.name === 'approval diagnostic'
+        && otelAttributes(row)['dsh.approval.id'] === 'langfuse-cloud-e2e-approval')
       const costReady = !REQUIRE_TOTAL_COST || stepGenerations.every(row => (
         typeof row.totalCost === 'number' && Number.isFinite(row.totalCost) && row.totalCost > 0
       ))
@@ -143,6 +172,9 @@ describe.skipIf(!PUBLIC_KEY || !SECRET_KEY)('Langfuse cloud round trip', () => {
         && root.traceName?.endsWith(' · turn 1') === true
         && childRoot?.metadata?.dsh_parent_session_id === parentSessionId
         && childRoot.metadata.dsh_parent_trace_id === root.traceId
+        && diagnosticGeneration !== undefined
+        && otelAttributes(diagnosticTool)['dsh.tool.error.code'] === 'DIAGNOSTIC_REJECTED'
+        && otelAttributes(approval)['dsh.approval.outcome'] === 'rejected'
       if (ready || Date.now() >= deadline) break
       await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS))
     }
@@ -151,9 +183,10 @@ describe.skipIf(!PUBLIC_KEY || !SECRET_KEY)('Langfuse cloud round trip', () => {
     // Langfuse normalizes canonical inclusive OTel usage back into mutually
     // exclusive buckets: 16 total input = 11 uncached + 2 read + 3 created.
     const generations = rows.filter(row => row.type === 'GENERATION')
-    const stepGenerations = generations.filter(row => row.name === 'step 1' || row.name === 'step 2')
+    const stepGenerations = generations.filter(row => row.sessionId === parentSessionId
+      && (row.name === 'step 1' || row.name === 'step 2'))
     for (const generation of stepGenerations) expect(generation.model).toBe(CLOUD_STEP_MODEL)
-    const step1 = generations.find(row => row.name === 'step 1')
+    const step1 = generations.find(row => row.sessionId === parentSessionId && row.name === 'step 1')
     expect(step1?.usageDetails).toMatchObject({
       input: 11,
       output: 3,
@@ -164,7 +197,7 @@ describe.skipIf(!PUBLIC_KEY || !SECRET_KEY)('Langfuse cloud round trip', () => {
     expect(step1?.outputUsage).toBe(3)
     expect(step1?.totalUsage).toBe(19)
 
-    const step2 = generations.find(row => row.name === 'step 2')
+    const step2 = generations.find(row => row.sessionId === parentSessionId && row.name === 'step 2')
     expect(step2?.usageDetails).toMatchObject({
       input: 7,
       output: 4,
@@ -257,6 +290,58 @@ describe.skipIf(!PUBLIC_KEY || !SECRET_KEY)('Langfuse cloud round trip', () => {
     })
     expect(childRoot?.metadata?.dsh_seed_length).toEqual(expect.any(Number))
     expect(childRoot).toMatchObject({ environment: 'integration', traceName: 'dsh turn 2' })
+
+    // The child emits a retry lifecycle plus one diagnostic request. Langfuse
+    // v2 exposes observations, not embedded OTel span events, so Cloud proves
+    // the retry did not fabricate extra generations while the local raw-OTLP
+    // E2E owns the retry event payload assertions.
+    const diagnosticGenerations = generations.filter(row => row.sessionId === childSessionId && row.name === 'step 1')
+    expect(diagnosticGenerations).toHaveLength(1)
+    const diagnosticGeneration = diagnosticGenerations[0]!
+    expect(diagnosticGeneration).toMatchObject({
+      model: CLOUD_STEP_MODEL,
+      parentObservationId: childRoot?.id,
+      environment: 'integration',
+      traceName: 'dsh turn 2',
+    })
+
+    const diagnosticTool = rows.find(row => row.sessionId === childSessionId
+      && row.type === 'TOOL'
+      && row.name === 'diagnostic'
+      && row.level === 'ERROR')
+    expect(diagnosticTool).toMatchObject({
+      parentObservationId: diagnosticGeneration.id,
+      level: 'ERROR',
+      statusMessage: 'DIAGNOSTIC_REJECTED',
+      environment: 'integration',
+      traceName: 'dsh turn 2',
+    })
+    expect(JSON.stringify(diagnosticTool?.output)).toContain('cloud diagnostic second block')
+    expect(otelAttributes(diagnosticTool)).toMatchObject({
+      'dsh.tool.error.name': 'DiagnosticError',
+      'dsh.tool.error.code': 'DIAGNOSTIC_REJECTED',
+      'dsh.tool.outcome': 'error',
+    })
+
+    const approval = rows.find(row => row.sessionId === childSessionId
+      && row.type === 'SPAN'
+      && row.name === 'approval diagnostic'
+      && otelAttributes(row)['dsh.approval.id'] === 'langfuse-cloud-e2e-approval')
+    expect(approval).toMatchObject({
+      parentObservationId: diagnosticTool?.id,
+      environment: 'integration',
+      traceName: 'dsh turn 2',
+    })
+    expect(otelAttributes(approval)).toMatchObject({
+      'dsh.approval.outcome': 'rejected',
+      'dsh.approval.reason': 'exercise cloud approval telemetry',
+      'dsh.approval.tool.name': 'diagnostic',
+      'dsh.approval.tool.call_id': 'langfuse-cloud-e2e-diagnostic-call',
+    })
+    for (const observation of [diagnosticGeneration, diagnosticTool!, approval!]) {
+      expect(observation.tags).toEqual(expect.arrayContaining(['dsh', 'e2e', 'cloud']))
+      expect(observation.userId).toBe('dsh-plugin-langfuse-e2e')
+    }
 
     // The current read API returns one typed `value` and a discriminated
     // session subject. Poll it separately because trace and Score ingestion

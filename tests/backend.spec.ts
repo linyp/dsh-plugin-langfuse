@@ -19,12 +19,16 @@ vi.mock('../src/otel.ts', async (importOriginal) => {
   } = await import('@opentelemetry/sdk-trace-base')
   return {
     ...original,
-    buildTracerPipeline: (options: { scopeName: string; scopeVersion: string }) => {
+    buildTracerPipeline: (options: {
+      scopeName: string
+      scopeVersion: string
+      onExportResult?: (success: boolean, spanCount: number, error?: Error) => void
+    }) => {
       const exporter = new InMemorySpanExporter()
       const provider = new BasicTracerProvider({
         spanProcessors: [new SimpleSpanProcessor(exporter)],
       })
-      pipelines.push({ exporter, provider })
+      pipelines.push({ exporter, provider, onExportResult: options.onExportResult })
       return {
         provider,
         tracer: provider.getTracer(options.scopeName, options.scopeVersion),
@@ -46,6 +50,7 @@ import {
 
 interface CapturedPipeline {
   exporter: { getFinishedSpans(): ReadableSpan[] }
+  onExportResult?: (success: boolean, spanCount: number, error?: Error) => void
 }
 
 const USER_MESSAGE = createUserMessage({
@@ -109,6 +114,37 @@ function normalize(spans: ReadableSpan[]): unknown[] {
 }
 
 describe('LangfuseSessionTelemetryBackend', () => {
+  it('exposes observed exporter failure and recovery through the public status API', async () => {
+    const mounted = await mount(LangfuseTelemetryMode.FULL)
+    const backend = mounted.ctx.get('sessionTelemetry') as LangfuseSessionTelemetryBackend
+    expect(backend.status().state).toBe('starting')
+
+    mounted.pipeline.onExportResult?.(false, 2, Object.assign(new Error('HTTP 503'), { code: 'UNAVAILABLE' }))
+    expect(backend.status()).toMatchObject({
+      state: 'degraded',
+      traces: {
+        failedBatches: 1,
+        failedSpans: 2,
+        consecutiveFailures: 1,
+        lastError: { code: 'UNAVAILABLE', message: 'HTTP 503' },
+      },
+    })
+
+    mounted.pipeline.onExportResult?.(true, 3)
+    expect(backend.status()).toMatchObject({
+      state: 'healthy',
+      traces: {
+        successfulBatches: 1,
+        successfulSpans: 3,
+        failedBatches: 1,
+        failedSpans: 2,
+        consecutiveFailures: 0,
+      },
+    })
+
+    await mounted.ctx.fiber.dispose()
+  })
+
   it('replays only a canonical feedback-gated prefix through the same tree projection as FULL', async () => {
     const full = await mount(LangfuseTelemetryMode.FULL)
     appendTurn(full.session)

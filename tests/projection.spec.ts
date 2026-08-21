@@ -764,10 +764,15 @@ describe('SessionSpanFolder', () => {
     expect(approvals).toHaveLength(2)
     expect(approvals[0]!.parentSpanContext?.spanId).toBe(tool.spanContext().spanId)
     expect(approvals[0]!.attributes).toMatchObject({
+      'langfuse.observation.type': 'span',
       'dsh.approval.id': 'approval-1',
       'dsh.approval.outcome': 'rejected',
       'dsh.approval.reason': 'writes outside workspace',
+      'dsh.approval.tool.name': 'bash',
+      'dsh.approval.tool.call_id': 'call-1',
     })
+    expect(approvals[0]!.attributes['gen_ai.tool.name']).toBeUndefined()
+    expect(approvals[0]!.attributes['gen_ai.tool.call.id']).toBeUndefined()
     expect(millis(approvals[0]!.startTime)).toBe(1_030)
     expect(millis(approvals[0]!.endTime)).toBe(1_130)
     expect(approvals[0]!.status.code).toBe(SpanStatusCode.UNSET)
@@ -778,13 +783,18 @@ describe('SessionSpanFolder', () => {
     expect(approvals[1]!.status.code).toBe(SpanStatusCode.ERROR)
   })
 
-  it('closes an inherited orphan compaction at session/end-seed', () => {
+  it('closes turn-owned and standalone inherited orphan compactions at session/end-seed', () => {
     folder.fold(ledger('turn/start', 1, 1_000, { turn: 1 }))
     folder.fold(ledger('compaction/start', 2, 1_010, { compactionId: 'inherited', turn: 1 }))
     folder.fold(ledger('session/end-seed', 3, 1_020, {}))
     folder.fold(ledger('turn/end', 4, 1_030, { turn: 1, reason: { kind: 'completed' } }))
 
-    const compaction = spansByName().get('compaction')!
+    folder.fold(ledger('compaction/start', 5, 1_040, { compactionId: 'standalone-inherited', turn: null }))
+    folder.fold(ledger('session/end-seed', 6, 1_050, {}))
+
+    const compactions = exporter.getFinishedSpans().filter(span => span.name === 'compaction')
+    expect(compactions).toHaveLength(2)
+    const compaction = compactions.find(span => span.attributes['dsh.compaction.id'] === 'inherited')!
     expect(millis(compaction.endTime)).toBe(1_020)
     expect(compaction.status.code).toBe(SpanStatusCode.ERROR)
     expect(compaction.attributes).toMatchObject({
@@ -793,6 +803,16 @@ describe('SessionSpanFolder', () => {
       'dsh.force_ended': true,
     })
     expect(compaction.attributes['dsh.compaction.error']).toContain('session/end-seed')
+
+    const standalone = compactions.find(span => span.attributes['dsh.compaction.id'] === 'standalone-inherited')!
+    expect(millis(standalone.endTime)).toBe(1_050)
+    expect(standalone.status.code).toBe(SpanStatusCode.ERROR)
+    expect(standalone.attributes).toMatchObject({
+      'dsh.compaction.incomplete': true,
+      'dsh.incomplete_reason': 'seed-boundary',
+      'dsh.force_ended': true,
+      'langfuse.trace.name': 'dsh compaction',
+    })
   })
 
   it('aggregates human inputs and requires opt-in for plugin context', () => {

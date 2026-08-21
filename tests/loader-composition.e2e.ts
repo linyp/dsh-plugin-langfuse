@@ -14,6 +14,7 @@ import { basename, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { LOADER_SMOKE_TEST_TIMEOUT_MS, runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
+import { SpanStatusCode } from '@opentelemetry/api'
 import {
   SYNTHETIC_PARENT_SPAN_ID,
   createDshCompactionTraceId,
@@ -195,18 +196,33 @@ describe('dsh-plugin-langfuse REAL composition', () => {
 
         const approval = spans.find(span => span.name === 'approval diagnostic')!
         expect(approval.parentSpanId).toBe(diagnosticTool.spanId)
+        expect(attr(approval, 'langfuse.observation.type')).toEqual({ stringValue: 'span' })
         expect(attr(approval, 'dsh.approval.outcome')).toEqual({ stringValue: 'rejected' })
         expect(attr(approval, 'dsh.approval.reason')).toEqual({ stringValue: 'exercise approval telemetry' })
+        expect(attr(approval, 'dsh.approval.tool.name')).toEqual({ stringValue: 'diagnostic' })
+        expect(attr(approval, 'dsh.approval.tool.call_id')).toEqual({ stringValue: 'langfuse-e2e-diagnostic-call' })
+        expect(attr(approval, 'gen_ai.tool.name')).toBeUndefined()
+        expect(attr(approval, 'gen_ai.tool.call.id')).toBeUndefined()
 
         // A compaction outside an open turn becomes a stable standalone trace
         // while retaining the same Langfuse correlation identity.
-        const compaction = spans.find(span => span.name === 'compaction')!
+        const compaction = spans.find(span => span.name === 'compaction'
+          && attr(span, 'dsh.compaction.id')?.['stringValue'] === 'e2e-compaction')!
         expect(compaction.traceId).toBe(createDshCompactionTraceId(dshSessionId, 'e2e-compaction'))
         expect(compaction.parentSpanId).toBe(SYNTHETIC_PARENT_SPAN_ID)
         expect(attr(compaction, 'langfuse.observation.type')).toEqual({ stringValue: 'generation' })
         expect(attr(compaction, 'langfuse.observation.output')).toEqual({ stringValue: '"e2e compacted context"' })
         expect(attr(compaction, 'dsh.compaction.shadowed_token_count')).toEqual({ intValue: 512 })
         expect(attr(compaction, 'dsh.compaction.summary_seen')).toEqual({ boolValue: true })
+
+        const seedOrphan = spans.find(span => span.name === 'compaction'
+          && attr(span, 'dsh.compaction.id')?.['stringValue'] === 'e2e-seed-orphan')!
+        expect(seedOrphan).toBeDefined()
+        expect(seedOrphan.traceId).toBe(createDshCompactionTraceId(dshSessionId, 'e2e-seed-orphan'))
+        expect(seedOrphan.status?.code).toBe(SpanStatusCode.ERROR)
+        expect(attr(seedOrphan, 'dsh.compaction.incomplete')).toEqual({ boolValue: true })
+        expect(attr(seedOrphan, 'dsh.incomplete_reason')).toEqual({ stringValue: 'seed-boundary' })
+        expect(attr(seedOrphan, 'dsh.force_ended')).toEqual({ boolValue: true })
 
         // Correlation identity rides every span on the wire — Langfuse v4
         // filters per observation, so the root-span stamp alone is not enough.

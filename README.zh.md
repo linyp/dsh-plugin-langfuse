@@ -184,9 +184,11 @@ npm run build && npm run test:e2e   # REAL composition：经 Loader 启动真实
 npm run test:package           # npm pack + 空 consumer 安装/import + bundle 组合
 ```
 
-e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`）：fixture `cordis.yml` 加载**构建产物** `lib/index.js` —— 与部署加载的是同一个文件 —— 断言针对 wire（包括独立 compaction trace），而非内部实现。
+e2e 沿用官方仓库的 REAL-composition 模式（`@deepseek-ai/dsh-app-boot` + `@deepseek-ai/dsh-loader-smoke`）：fixture `cordis.yml` 加载**构建产物** `lib/index.js` —— 与部署加载的是同一个文件 —— 断言针对 wire（包括 retry payload、approval/tool-error metadata、完整独立 compaction 与 seed-boundary orphan compaction），而非内部实现。
 
-存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata、独立 compaction 的身份/摘要/usage，并通过 Scores API 回读 feedback；未提供密钥时该测试自行跳过。设置 `LANGFUSE_REQUIRE_TOTAL_COST=1` 后，还会要求当前官方 `deepseek-v4-flash` step generation 的 `totalCost` 为有限正数；`LANGFUSE_E2E_COST_MODEL` 可选择采用相同价格的隔离测试别名。这是对测试项目 Langfuse 模型计价配置的 opt-in 验证，插件本身不会硬编码价格。
+另一个本地 e2e 使用真实 `OTLPTraceExporter` 与 `BatchSpanProcessor`，依次触发 HTTP 503 和 200，并验证公开 backend status 从 degraded 恢复为 healthy；backend 单元测试还会独立锁定 observer 到 `status()` 的接线。
+
+存在 `LANGFUSE_PUBLIC_KEY` 与 `LANGFUSE_SECRET_KEY` 时，同一条 e2e 命令还会执行 Langfuse Cloud 往返测试，通过 v4 Observations API 校验根 input/output、usage、逐 observation 关联、parent/child metadata、独立 compaction 的身份/摘要/usage、approval outcome 与结构化 tool error，并通过 Scores API 回读 feedback；它还会验证 retry 生命周期不会生成重复 generation。retry event payload 本身由本地 raw-OTLP wire 测试锁定，因为 Observations API 返回 observation，但不返回其内嵌的 OTel span event。未提供密钥时该测试自行跳过。设置 `LANGFUSE_REQUIRE_TOTAL_COST=1` 后，还会要求当前官方 `deepseek-v4-flash` step generation 的 `totalCost` 为有限正数；`LANGFUSE_E2E_COST_MODEL` 可选择采用相同价格的隔离测试别名。这是对测试项目 Langfuse 模型计价配置的 opt-in 验证，插件本身不会硬编码价格。
 
 ## 版本兼容
 
